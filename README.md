@@ -6,7 +6,8 @@
 
 - 📱 스마트폰 후면 카메라로 실시간 위험지대 감지
 - 🔔 85% 이상 정확도로 위험 감지 시 진동 알림
-- 🧠 Teachable Machine AI 모델 사용
+- 🧠 YOLO 객체 감지 모델 (ONNX Runtime Web, WebGPU/WASM) 사용
+- 📍 박스 위치로 방향(좌/정면/우)과 근접도를 계산해 진동 패턴을 다르게 알림
 - 🌐 클라우드 기반 - 설치 불필요
 
 ## 🏷️ 감지 가능한 위험
@@ -25,8 +26,8 @@
 
 ## 🛠️ 기술 스택
 
-- **TensorFlow.js 4.2.0** - AI 추론
-- **Teachable Machine Image Model** - 이미지 분류
+- **ONNX Runtime Web 1.30** - 브라우저 AI 추론 (WebGPU 우선, WASM 폴백)
+- **Ultralytics YOLO11n** - 객체 감지 (학습 방법: `docs/training-guide.md`)
 - **Vibration API** - 스마트폰 진동
 - **MediaDevices API** - 카메라 접근
 
@@ -77,10 +78,11 @@ http://localhost:8000
 
 ## 📊 AI 모델 정보
 
-- **모델 출처**: Teachable Machine
-- **모델 ID**: dkATWsVft
-- **입력 크기**: 224x224 pixels
-- **클래스 수**: 3개 (계단, 횡단보도, 기둥&가로등)
+- **모델 파일**: `best.onnx` + `labels.json` (Colab 노트북 `tools/train_colab.ipynb` 로 생성)
+- **입력 크기**: 320x320 pixels (letterbox)
+- **클래스**: crosswalk, stairs, pole, person, vehicle
+- **테스트 모드**: `index.html?model=다른모델.onnx&labels=labels_coco.json&image=사진.jpg` 로 카메라 없이 정지 이미지 검사 가능
+- 이전 Teachable Machine 모델 파일(`model.json`, `weights.bin`, `metadata.json`)은 새 모델 검증 후 삭제 예정
 
 ## 🐛 문제 해결
 

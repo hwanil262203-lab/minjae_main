@@ -1,0 +1,5 @@
+{
+  "names": ["crosswalk", "stairs", "pole", "person", "vehicle"],
+  "imgsz": 320,
+  "nms_in_model": true
+}

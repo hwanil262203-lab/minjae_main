@@ -13,14 +13,7 @@
         background: #0b1020;
         color: #e8ecf1;
       }
-      .container {
-        display: grid;
-        grid-template-columns: 1fr 360px;
-        gap: 16px;
-        height: 100%;
-      }
       header {
-        grid-column: 1 / -1;
         padding: 12px 16px;
         background: #0d1328;
         border-bottom: 1px solid #1b254b;
@@ -54,14 +47,12 @@
         border-radius: 8px;
         overflow: hidden;
         max-width: 640px;
-        max-height: 480px;
       }
       video {
         width: 100%;
         height: auto;
         display: block;
         max-width: 640px;
-        max-height: 480px;
       }
       canvas {
         position: absolute;
@@ -90,7 +81,7 @@
         font-size: 13px;
         color: #b7c2d7;
       }
-      .row input[type="text"], .row input[type="number"] {
+      .row input[type="number"] {
         flex: 1;
         background: #0b1020;
         border: 1px solid #1b254b;
@@ -121,48 +112,6 @@
         font-size: 11px;
         white-space: pre-wrap;
       }
-      #predictions {
-        background: #0d1328;
-        border: 1px solid #1b254b;
-        border-radius: 8px;
-        padding: 16px;
-      }
-      #predictions h3 {
-        margin: 0 0 12px 0;
-        font-size: 14px;
-        color: #b7c2d7;
-      }
-      .prediction-bar {
-        margin-bottom: 12px;
-      }
-      .prediction-label {
-        display: flex;
-        justify-content: space-between;
-        margin-bottom: 4px;
-        font-size: 13px;
-        color: #e8ecf1;
-      }
-      .prediction-track {
-        background: #1b254b;
-        height: 24px;
-        border-radius: 4px;
-        overflow: hidden;
-        position: relative;
-      }
-      .prediction-fill {
-        background: linear-gradient(90deg, #3356ff, #5577ff);
-        height: 100%;
-        transition: width 0.2s ease;
-        display: flex;
-        align-items: center;
-        padding-left: 8px;
-        font-size: 12px;
-        font-weight: bold;
-        color: white;
-      }
-      .prediction-fill.danger {
-        background: linear-gradient(90deg, #ff5722, #ff8a50);
-      }
       .badge {
         display: inline-flex;
         align-items: center;
@@ -174,7 +123,56 @@
         border-radius: 999px;
         font-size: 12px;
       }
-      
+      #predictions {
+        background: #0d1328;
+        border: 1px solid #1b254b;
+        border-radius: 8px;
+        padding: 16px;
+      }
+      #predictions h3 {
+        margin: 0 0 12px 0;
+        font-size: 14px;
+        color: #b7c2d7;
+      }
+      #detections {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        font-size: 13px;
+      }
+      #detections li {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: #0b1020;
+        border: 1px solid #1b254b;
+      }
+      #detections li.danger {
+        border-color: #ef4444;
+        background: rgba(239, 68, 68, 0.12);
+      }
+      #detections li.muted {
+        color: #6b7a99;
+      }
+      #detections .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .hint {
+        background: #192240;
+        border: 1px solid #2a3a78;
+        padding: 8px;
+        border-radius: 6px;
+        font-size: 12px;
+      }
+
       /* 드래그 가능한 원형 인디케이터 */
       #floatingIndicator {
         position: fixed;
@@ -197,12 +195,10 @@
         -webkit-user-select: none;
         touch-action: none;
       }
-      
       #floatingIndicator.danger {
         background: #ef4444;
         box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 20px rgba(239, 68, 68, 0.8);
       }
-      
       #floatingIndicator.dragging {
         opacity: 0.8;
         cursor: grabbing;
@@ -210,11 +206,10 @@
     </style>
   </head>
   <body>
-    <!-- 드래그 가능한 상태 인디케이터 -->
     <div id="floatingIndicator" title="안전 상태 (드래그하여 이동 가능)">✓</div>
-    
+
     <header>
-      <h1>위험지대 감지 + 진동 알림 <span style="font-size: 12px; color: #4ade80; font-weight: normal;">🤖 자동 감지 모드</span></h1>
+      <h1>위험지대 감지 + 진동 알림 <span style="font-size: 12px; color: #4ade80; font-weight: normal;">🤖 YOLO 객체 감지</span></h1>
     </header>
     <main>
       <div class="content">
@@ -223,81 +218,42 @@
           <canvas id="overlay"></canvas>
         </section>
         <aside class="sidebar">
-        <div style="background: #192240; border: 1px solid #2a3a78; padding: 8px; border-radius: 6px; font-size: 12px; margin-bottom: 8px;">
-          💡 페이지가 로드되면 자동으로 카메라와 감지가 시작됩니다.
-        </div>
-        <div class="row">
-          <label>감지 임계치</label>
-          <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.90" />
-        </div>
-        <div class="row">
-          <label>확정 프레임</label>
-          <input id="steadyFrames" type="number" min="1" max="30" step="1" value="4" />
-        </div>
-        <div class="row">
-          <button id="btnCamera">📷 카메라 시작</button>
-        </div>
-        <div class="row">
-          <button id="btnStart">▶️ 감지 시작</button>
-          <button id="btnStop" class="secondary">⏹️ 정지</button>
-        </div>
-        <div>
-          <div class="badge" id="status">초기화 중...</div>
-        </div>
-        <div class="log" id="log"></div>
+          <div class="hint">💡 페이지가 열리면 모델과 카메라가 자동으로 시작됩니다. 진동 패턴: 왼쪽 1회 · 정면 2회 · 오른쪽 3회, 가까우면 짧고 빠르게.</div>
+          <div class="row">
+            <label>신뢰도 임계치</label>
+            <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.50" />
+          </div>
+          <div class="row">
+            <label>근접 임계치</label>
+            <input id="proximity" type="number" min="0" max="1" step="0.05" value="0.20" title="박스 높이 ÷ 화면 높이. 이 값 이상이어야 위험으로 판단" />
+          </div>
+          <div class="row">
+            <label>확정 프레임</label>
+            <input id="steadyFrames" type="number" min="1" max="30" step="1" value="3" />
+          </div>
+          <div class="row">
+            <button id="btnCamera">📷 카메라 시작</button>
+          </div>
+          <div class="row">
+            <button id="btnStart">▶️ 감지 시작</button>
+            <button id="btnStop" class="secondary">⏹️ 정지</button>
+          </div>
+          <div class="row">
+            <div class="badge" id="status">초기화 중...</div>
+            <div class="badge" id="engine">엔진: -</div>
+          </div>
+          <div class="log" id="log"></div>
         </aside>
       </div>
-      
-      <!-- 예측 결과 시각화 -->
+
       <section id="predictions">
-        <h3>📊 실시간 예측 결과</h3>
-        <div class="prediction-bar">
-          <div class="prediction-label">
-            <span>횡단보도</span>
-            <span id="pred-0-percent">0%</span>
-          </div>
-          <div class="prediction-track">
-            <div class="prediction-fill" id="pred-0-bar" style="width: 0%"></div>
-          </div>
-        </div>
-        <div class="prediction-bar">
-          <div class="prediction-label">
-            <span>계단</span>
-            <span id="pred-1-percent">0%</span>
-          </div>
-          <div class="prediction-track">
-            <div class="prediction-fill" id="pred-1-bar" style="width: 0%"></div>
-          </div>
-        </div>
-        <div class="prediction-bar">
-          <div class="prediction-label">
-            <span>기둥, 가로등</span>
-            <span id="pred-2-percent">0%</span>
-          </div>
-          <div class="prediction-track">
-            <div class="prediction-fill" id="pred-2-bar" style="width: 0%"></div>
-          </div>
-        </div>
-        <div class="prediction-bar">
-          <div class="prediction-label">
-            <span>평지 (안전)</span>
-            <span id="pred-3-percent">0%</span>
-          </div>
-          <div class="prediction-track">
-            <div class="prediction-fill" id="pred-3-bar" style="width: 0%; background: linear-gradient(90deg, #22c55e, #4ade80);"></div>
-          </div>
-        </div>
+        <h3>📊 실시간 감지 결과 (위험도 순)</h3>
+        <ul id="detections"><li class="muted">대기 중</li></ul>
       </section>
     </main>
 
-    <!-- TensorFlow.js from unpkg -->
-    <script src="https://unpkg.com/@tensorflow/tfjs@4.2.0/dist/tf.min.js"></script>
-    <!-- Teachable Machine from unpkg -->
-    <script src="https://unpkg.com/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
-    <!-- Main Script -->
+    <!-- ONNX Runtime Web (WebGPU + WASM) -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.min.js"></script>
     <script src="main.js"></script>
   </body>
-  </html>
-
-
-
+</html>

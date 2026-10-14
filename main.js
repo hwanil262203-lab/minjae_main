@@ -1,10 +1,43 @@
 /*
-  Teachable Machine + Smartphone Vibration
-  - Loads TM image model from server files (keras_model.h5 + labels.txt)
-  - Runs webcam inference loop
-  - Applies threshold (85%) + steady-frame hysteresis
-  - Vibrates smartphone when danger detected
+  YOLO 객체 감지 (ONNX Runtime Web) + 스마트폰 진동
+  - best.onnx (Ultralytics YOLO export, opset 12) 를 브라우저에서 실행
+  - WebGPU 우선, 실패 시 WASM(CPU) 폴백
+  - 박스 위치로 방향(좌/중/우), 박스 높이로 근접도 계산
+  - 신뢰도 임계치 + 연속 프레임 히스테리시스 후 방향/근접도별 진동 패턴
 */
+
+const CONFIG = {
+  // ?model=yolo11n.onnx 처럼 주소로 모델 파일을 바꿔 테스트할 수 있다
+  modelUrl: new URLSearchParams(location.search).get('model') || './best.onnx',
+  labelsUrl: new URLSearchParams(location.search).get('labels') || './labels.json',
+  ortVersion: '1.30.0',
+  nmsIou: 0.45,
+  maxDraw: 8,
+  vibrateRepeatMs: 1500, // 위험이 계속되면 이 간격으로 진동을 다시 울림
+};
+
+// 클래스별 한국어 이름, 위험 가중치(0~1), 색. 키는 labels.json 의 영어 이름.
+const CLASS_INFO = {
+  crosswalk: { ko: '횡단보도', weight: 0.8, color: '#facc15' },
+  stairs: { ko: '계단', weight: 1.0, color: '#f97316' },
+  pole: { ko: '기둥·가로등', weight: 1.0, color: '#ef4444' },
+  person: { ko: '사람', weight: 0.6, color: '#38bdf8' },
+  vehicle: { ko: '차량', weight: 0.9, color: '#a855f7' },
+  // COCO 사전학습 모델로 파이프라인을 테스트할 때 쓰이는 보조 항목
+  car: { ko: '자동차', weight: 0.9, color: '#a855f7' },
+  bus: { ko: '버스', weight: 0.9, color: '#a855f7' },
+  truck: { ko: '트럭', weight: 0.9, color: '#a855f7' },
+  bicycle: { ko: '자전거', weight: 0.7, color: '#a855f7' },
+  motorcycle: { ko: '오토바이', weight: 0.8, color: '#a855f7' },
+  'fire hydrant': { ko: '소화전', weight: 0.7, color: '#ef4444' },
+  bench: { ko: '벤치', weight: 0.6, color: '#ef4444' },
+  'traffic light': { ko: '신호등', weight: 0.2, color: '#94a3b8' },
+  'stop sign': { ko: '정지표지', weight: 0.2, color: '#94a3b8' },
+  dog: { ko: '개', weight: 0.5, color: '#38bdf8' },
+  chair: { ko: '의자', weight: 0.5, color: '#ef4444' },
+};
+const DEFAULT_CLASS = { weight: 0.5, color: '#94a3b8' };
+const DIR_KO = { left: '왼쪽', center: '정면', right: '오른쪽' };
 
 const ui = {
   video: document.getElementById('video'),
@@ -14,18 +47,24 @@ const ui = {
   btnStop: document.getElementById('btnStop'),
   threshold: document.getElementById('threshold'),
   steadyFrames: document.getElementById('steadyFrames'),
+  proximity: document.getElementById('proximity'),
   status: document.getElementById('status'),
+  engine: document.getElementById('engine'),
   log: document.getElementById('log'),
+  detections: document.getElementById('detections'),
   floatingIndicator: document.getElementById('floatingIndicator'),
 };
 
-let DANGER_LABELS = []; // 위험 라벨들 (labels.txt에서 자동 로드)
-
-let model = null;
+let session = null;
+let labels = { names: [], imgsz: 640, nms_in_model: null };
+let inputName = null;
+let outputName = null;
+let inputSize = 640;
+let engineName = '-';
 let webcamStream = null;
+let testImage = null; // ?image=... 로 지정한 정지 이미지 (카메라 없이 테스트)
 let isRunning = false;
 let animationHandle = null;
-let isVibrating = false;
 
 const log = (msg) => {
   const t = new Date().toLocaleTimeString();
@@ -37,6 +76,13 @@ function setStatus(text) {
   ui.status.textContent = text;
 }
 
+function classInfo(label) {
+  return CLASS_INFO[label] || { ...DEFAULT_CLASS, ko: label };
+}
+
+// ============================================
+// 카메라
+// ============================================
 async function openCamera() {
   if (webcamStream) {
     log('카메라가 이미 실행 중입니다.');
@@ -44,119 +90,251 @@ async function openCamera() {
   }
   try {
     log('카메라 권한 요청 중...');
-    webcamStream = await navigator.mediaDevices.getUserMedia({ 
-      video: { 
-        facingMode: 'environment',
-        width: { ideal: 640 },
-        height: { ideal: 480 }
-      }, 
-      audio: false 
+    webcamStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false,
     });
     ui.video.srcObject = webcamStream;
-    
-    // 비디오가 준비될 때까지 대기
     await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error('비디오 로드 타임아웃'));
-      }, 10000);
-      
-      ui.video.onloadedmetadata = () => {
+      const timeout = setTimeout(() => reject(new Error('비디오 로드 타임아웃')), 10000);
+      const ready = () => {
         clearTimeout(timeout);
         ui.overlay.width = ui.video.videoWidth;
         ui.overlay.height = ui.video.videoHeight;
         resolve();
       };
-      
-      // 이미 메타데이터가 로드된 경우
-      if (ui.video.readyState >= 1) {
-        clearTimeout(timeout);
-        ui.overlay.width = ui.video.videoWidth;
-        ui.overlay.height = ui.video.videoHeight;
-        resolve();
-      }
+      ui.video.onloadedmetadata = ready;
+      if (ui.video.readyState >= 1) ready();
     });
-    
     await ui.video.play();
-    
     log(`✓ 카메라 시작됨 (${ui.video.videoWidth}x${ui.video.videoHeight})`);
-    console.log('비디오 크기:', ui.video.videoWidth, 'x', ui.video.videoHeight);
   } catch (e) {
     log(`✗ 카메라 오류: ${e.message}`);
     console.error('카메라 오류:', e);
   }
 }
 
+// 테스트 모드: ?image=sample.jpg 로 정지 이미지를 카메라 대신 사용
+async function loadTestImage(url) {
+  try {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = () => reject(new Error('이미지를 불러오지 못했습니다'));
+      img.src = url;
+    });
+    testImage = img;
+    ui.video.style.display = 'none';
+    img.style.cssText = 'width:100%;height:auto;display:block;max-width:640px';
+    ui.video.parentElement.insertBefore(img, ui.overlay);
+    ui.overlay.width = img.naturalWidth;
+    ui.overlay.height = img.naturalHeight;
+    log(`✓ 테스트 이미지 사용 (${img.naturalWidth}x${img.naturalHeight}): ${url}`);
+  } catch (e) {
+    log(`✗ 테스트 이미지 오류: ${e.message}`);
+  }
+}
+
+// ============================================
+// 모델 로드 (ONNX Runtime Web)
+// ============================================
 async function loadModel() {
   try {
     setStatus('모델 로딩 중...');
-    log('로컬 모델 파일 로딩 중...');
-    
-    // 로컬 모델 파일 사용
-    const modelURL = './model.json';
-    const metadataURL = './metadata.json';
-    
-    model = await tmImage.load(modelURL, metadataURL);
-    
-    // metadata에서 라벨 추출
-    DANGER_LABELS = model.getClassLabels();
-    
-    log(`✓ 모델 로드 완료!`);
-    log(`감지 라벨: ${DANGER_LABELS.join(', ')}`);
+    ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${CONFIG.ortVersion}/dist/`;
+
+    // labels.json (없어도 동작: 클래스 이름이 숫자로 표시됨)
+    try {
+      const r = await fetch(CONFIG.labelsUrl, { cache: 'no-store' });
+      if (r.ok) labels = { ...labels, ...(await r.json()) };
+    } catch (_) {
+      /* 무시 */
+    }
+    log(`모델 파일: ${CONFIG.modelUrl}`);
+
+    // WebGPU 우선, 실패하면 WASM
+    const providers = navigator.gpu ? ['webgpu', 'wasm'] : ['wasm'];
+    let lastErr = null;
+    for (const ep of providers) {
+      try {
+        session = await ort.InferenceSession.create(CONFIG.modelUrl, {
+          executionProviders: [ep],
+          graphOptimizationLevel: 'all',
+        });
+        engineName = ep;
+        break;
+      } catch (e) {
+        lastErr = e;
+        log(`${ep} 초기화 실패 → 다음 백엔드 시도 (${e.message.split('\n')[0]})`);
+      }
+    }
+    if (!session) throw lastErr || new Error('세션 생성 실패');
+
+    inputName = session.inputNames[0];
+    outputName = session.outputNames[0];
+
+    // 입력 크기: 모델 메타데이터 → labels.json → 640 순서로 결정
+    inputSize = labels.imgsz || 640;
+    const meta = session.inputMetadata && session.inputMetadata[0];
+    const dims = meta && (meta.shape || meta.dims);
+    if (dims && typeof dims[2] === 'number' && dims[2] > 0) inputSize = dims[2];
+
+    // 워밍업 겸 출력 형식 확인
+    const zeros = new ort.Tensor('float32', new Float32Array(3 * inputSize * inputSize), [1, 3, inputSize, inputSize]);
+    const t0 = performance.now();
+    const out = await session.run({ [inputName]: zeros });
+    const od = out[outputName].dims;
+    const nmsInModel = od.length === 3 && od[2] === 6;
+    labels.nms_in_model = nmsInModel;
+
+    ui.engine.textContent = `${engineName.toUpperCase()} · ${inputSize}px · NMS ${nmsInModel ? '내장' : 'JS'}`;
+    log(`✓ 모델 로드 완료 (${engineName}, 입력 ${inputSize}px, 출력 [${od.join(',')}], 워밍업 ${Math.round(performance.now() - t0)}ms)`);
+    log(`클래스: ${labels.names.join(', ') || '(labels.json 없음)'}`);
     setStatus('모델 준비 완료');
   } catch (e) {
     log(`✗ 모델 로드 실패: ${e.message}`);
     console.error('모델 로드 오류:', e);
     setStatus('모델 로드 실패');
+    session = null;
   }
 }
 
-function vibrateDevice() {
-  if (!('vibrate' in navigator)) {
-    return;
+// ============================================
+// 전처리: letterbox → NCHW float32 (0~1)
+// ============================================
+const pre = { canvas: document.createElement('canvas'), ctx: null };
+
+// 현재 프레임 소스 (카메라 또는 테스트 이미지)
+function frameSource() {
+  if (testImage) return { el: testImage, w: testImage.naturalWidth, h: testImage.naturalHeight };
+  return { el: ui.video, w: ui.video.videoWidth, h: ui.video.videoHeight };
+}
+
+function preprocess(src, S) {
+  if (pre.canvas.width !== S) {
+    pre.canvas.width = S;
+    pre.canvas.height = S;
+    pre.ctx = pre.canvas.getContext('2d', { willReadFrequently: true });
   }
-  // 2번 진동 패턴: [진동, 멈춤, 진동]
-  if (!isVibrating) {
-    isVibrating = true;
-    const success = navigator.vibrate([400, 200, 400]); // 400ms 진동, 200ms 멈춤, 400ms 진동
-    if (!success) {
-      isVibrating = false;
+  const vw = src.w;
+  const vh = src.h;
+  const scale = Math.min(S / vw, S / vh);
+  const nw = Math.round(vw * scale);
+  const nh = Math.round(vh * scale);
+  const dx = Math.floor((S - nw) / 2);
+  const dy = Math.floor((S - nh) / 2);
+  const ctx = pre.ctx;
+  ctx.fillStyle = '#727272';
+  ctx.fillRect(0, 0, S, S);
+  ctx.drawImage(src.el, 0, 0, vw, vh, dx, dy, nw, nh);
+  const { data } = ctx.getImageData(0, 0, S, S);
+  const area = S * S;
+  const f = new Float32Array(3 * area);
+  for (let i = 0, p = 0; i < area; i++, p += 4) {
+    f[i] = data[p] / 255;
+    f[area + i] = data[p + 1] / 255;
+    f[2 * area + i] = data[p + 2] / 255;
+  }
+  return { tensor: new ort.Tensor('float32', f, [1, 3, S, S]), scale, dx, dy };
+}
+
+// ============================================
+// 후처리: 출력 텐서 → [{label, score, x1,y1,x2,y2}] (비디오 좌표)
+// ============================================
+function iou(a, b) {
+  const ix = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1));
+  const iy = Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+  const inter = ix * iy;
+  const ua = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
+  return ua > 0 ? inter / ua : 0;
+}
+
+function nms(cands, thr) {
+  cands.sort((a, b) => b.score - a.score);
+  const keep = [];
+  for (const c of cands) {
+    if (keep.every((k) => k.cls !== c.cls || iou(k, c) < thr)) keep.push(c);
+  }
+  return keep;
+}
+
+function postprocess(output, lb, conf, vw, vh) {
+  const d = output.dims;
+  const data = output.data;
+  let boxes = [];
+
+  if (d.length === 3 && d[2] === 6) {
+    // Ultralytics nms=True 출력: [1, max_det, 6] = x1,y1,x2,y2,conf,cls
+    for (let i = 0; i < d[1]; i++) {
+      const o = i * 6;
+      const s = data[o + 4];
+      if (s < conf) continue;
+      boxes.push({ x1: data[o], y1: data[o + 1], x2: data[o + 2], y2: data[o + 3], score: s, cls: data[o + 5] | 0 });
     }
-  }
-}
-
-function stopVibration() {
-  if (isVibrating) {
-    navigator.vibrate(0);
-    isVibrating = false;
-  }
-}
-
-function getDangerFromPredictions(predictions, threshold) {
-  // predictions: [{className, probability}] from Teachable Machine
-  // '평지'는 제외하고 위험 지대만 감지
-  const dangerClasses = ['횡단보도', '계단', '기둥, 가로등'];
-  
-  let best = { label: null, prob: 0 };
-  for (let i = 0; i < predictions.length; i++) {
-    const p = predictions[i];
-    // '평지'는 무시
-    if (p.className === '평지') continue;
-    
-    // 위험 지대만 체크
-    if (dangerClasses.includes(p.className) && p.probability > best.prob) {
-      best = { label: p.className, prob: p.probability };
+  } else if (d.length === 3) {
+    // 원시 출력: [1, 4+nc, N] (Ultralytics 기본) 또는 [1, N, 4+nc]
+    const transposed = d[1] > d[2];
+    const C = transposed ? d[2] : d[1];
+    const N = transposed ? d[1] : d[2];
+    const nc = C - 4;
+    const at = transposed ? (c, i) => data[i * C + c] : (c, i) => data[c * N + i];
+    const cands = [];
+    for (let i = 0; i < N; i++) {
+      let best = 0;
+      let bc = -1;
+      for (let c = 0; c < nc; c++) {
+        const s = at(4 + c, i);
+        if (s > best) {
+          best = s;
+          bc = c;
+        }
+      }
+      if (best < conf) continue;
+      const cx = at(0, i);
+      const cy = at(1, i);
+      const w = at(2, i);
+      const h = at(3, i);
+      cands.push({ x1: cx - w / 2, y1: cy - h / 2, x2: cx + w / 2, y2: cy + h / 2, score: best, cls: bc });
     }
+    boxes = nms(cands, CONFIG.nmsIou);
+  } else {
+    throw new Error(`지원하지 않는 출력 형식: [${d.join(',')}]`);
   }
-  
-  // 임계치 이상일 때만 위험으로 판단
-  if (best.label && best.prob >= threshold) return best;
-  return { label: null, prob: 0 };
+
+  // letterbox 좌표 → 비디오 좌표
+  const clampX = (v) => Math.max(0, Math.min(vw, v));
+  const clampY = (v) => Math.max(0, Math.min(vh, v));
+  return boxes.map((b) => ({
+    label: labels.names[b.cls] !== undefined ? labels.names[b.cls] : String(b.cls),
+    score: b.score,
+    x1: clampX((b.x1 - lb.dx) / lb.scale),
+    y1: clampY((b.y1 - lb.dy) / lb.scale),
+    x2: clampX((b.x2 - lb.dx) / lb.scale),
+    y2: clampY((b.y2 - lb.dy) / lb.scale),
+  }));
 }
 
-const hysteresisState = {
-  lastLabel: null,
-  steadyCount: 0,
-};
+// ============================================
+// 위험 판단: 방향 + 근접도 + 클래스 가중치
+// ============================================
+function assess(dets, vw, vh, minProximity) {
+  for (const det of dets) {
+    const info = classInfo(det.label);
+    det.ko = info.ko;
+    det.color = info.color;
+    det.prox = (det.y2 - det.y1) / vh; // 박스 높이 비율 = 근접도 (0~1)
+    const cx = (det.x1 + det.x2) / 2 / vw;
+    det.dir = cx < 0.35 ? 'left' : cx > 0.65 ? 'right' : 'center';
+    det.near = det.prox >= 0.5;
+    det.risk = det.score * info.weight * Math.min(1, det.prox / 0.5);
+  }
+  dets.sort((a, b) => b.risk - a.risk);
+  const best = dets.find((d) => d.prox >= minProximity && classInfo(d.label).weight >= 0.5);
+  return best || null;
+}
+
+const hysteresisState = { lastLabel: null, steadyCount: 0 };
 
 function updateHysteresis(currentLabel, requiredFrames) {
   if (currentLabel && currentLabel === hysteresisState.lastLabel) {
@@ -171,171 +349,87 @@ function updateHysteresis(currentLabel, requiredFrames) {
   return hysteresisState.steadyCount >= requiredFrames ? hysteresisState.lastLabel : null;
 }
 
-async function inferenceLoop() {
-  if (!model || !webcamStream) {
-    log('✗ 모델 또는 카메라가 준비되지 않았습니다.');
+// ============================================
+// 진동: 방향 = 펄스 개수(좌1/정면2/우3), 근접 = 펄스 길이(가까움 150ms / 보통 350ms)
+// ============================================
+const vib = { key: null, t: 0 };
+
+function vibrationPattern(dir, near) {
+  const pulses = dir === 'left' ? 1 : dir === 'center' ? 2 : 3;
+  const len = near ? 150 : 350;
+  const gap = 120;
+  const pattern = [];
+  for (let i = 0; i < pulses; i++) {
+    pattern.push(len);
+    if (i < pulses - 1) pattern.push(gap);
+  }
+  return pattern;
+}
+
+function vibrateFor(det) {
+  if (!('vibrate' in navigator)) return;
+  const key = `${det.label}|${det.dir}|${det.near}`;
+  const now = performance.now();
+  if (key !== vib.key || now - vib.t > CONFIG.vibrateRepeatMs) {
+    navigator.vibrate(vibrationPattern(det.dir, det.near));
+    vib.key = key;
+    vib.t = now;
+  }
+}
+
+function stopVibration() {
+  if (vib.key && 'vibrate' in navigator) navigator.vibrate(0);
+  vib.key = null;
+  vib.t = 0;
+}
+
+// ============================================
+// 화면 표시
+// ============================================
+function drawDetections(ctx, dets, best) {
+  const W = ctx.canvas.width;
+  const H = ctx.canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.font = '14px ui-monospace, monospace';
+  ctx.textBaseline = 'top';
+  for (const det of dets.slice(0, CONFIG.maxDraw)) {
+    const isBest = det === best;
+    ctx.lineWidth = isBest ? 4 : 2;
+    ctx.strokeStyle = det.color;
+    ctx.strokeRect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1);
+    const text = `${det.ko} ${(det.score * 100).toFixed(0)}%`;
+    const tw = ctx.measureText(text).width + 8;
+    ctx.fillStyle = det.color;
+    ctx.fillRect(det.x1, Math.max(0, det.y1 - 18), tw, 18);
+    ctx.fillStyle = '#0b1020';
+    ctx.fillText(text, det.x1 + 4, Math.max(0, det.y1 - 18) + 2);
+  }
+  if (best) {
+    ctx.font = 'bold 18px system-ui, sans-serif';
+    const text = `⚠ ${best.ko} · ${DIR_KO[best.dir]} · ${best.near ? '가까움' : '접근 중'}`;
+    const tw = ctx.measureText(text).width + 16;
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.85)';
+    ctx.fillRect(8, 8, tw, 30);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(text, 16, 14);
+  }
+}
+
+function updateDetectionList(dets, best) {
+  if (!dets.length) {
+    ui.detections.innerHTML = '<li class="muted">감지된 물체 없음</li>';
     return;
   }
-  isRunning = true;
-  setStatus('감지 중...');
-  log('예측 시작됨');
-  const ctx = ui.overlay.getContext('2d');
-
-  const step = async () => {
-    if (!isRunning) return;
-    try {
-      // Teachable Machine 모델로 예측
-      const predictions = await model.predict(ui.video);
-      
-      // 디버그: 첫 예측 시 로그
-      if (!window.firstPredictionLogged) {
-        console.log('첫 예측 결과:', predictions);
-        log(`예측 결과 받음: ${predictions.length}개 클래스`);
-        window.firstPredictionLogged = true;
-      }
-
-      // 예측 결과 시각화 업데이트
-      updatePredictionBars(predictions);
-
-      const threshold = parseFloat(ui.threshold.value) || 0.85;
-      const requiredFrames = parseInt(ui.steadyFrames.value, 10) || 4;
-      const best = getDangerFromPredictions(predictions, threshold);
-
-      const confirmed = updateHysteresis(best.label, requiredFrames);
-
-      // Draw overlay
-      ctx.clearRect(0, 0, ui.overlay.width, ui.overlay.height);
-      if (best.label) {
-        ctx.fillStyle = 'rgba(255, 87, 34, 0.25)';
-        ctx.fillRect(0, 0, ui.overlay.width, ui.overlay.height);
-        ctx.fillStyle = '#ffb199';
-        ctx.font = '16px ui-monospace, monospace';
-        ctx.fillText(`⚠️ ${best.label} ${(best.prob * 100).toFixed(1)}%`, 12, 28);
-      }
-
-      // Floating Indicator 업데이트 (90% 이상일 때 위험으로 표시)
-      const isDangerForIndicator = best.label && best.prob >= 0.90;
-      updateFloatingIndicator(isDangerForIndicator);
-
-      // 진동 제어 (일정한 강도)
-      if (confirmed) {
-        vibrateDevice();
-      } else {
-        stopVibration();
-      }
-    } catch (e) {
-      console.error('예측 오류:', e);
-      log(`감지 오류: ${e.message}`);
-    }
-    animationHandle = requestAnimationFrame(step);
-  };
-  animationHandle = requestAnimationFrame(step);
+  ui.detections.innerHTML = dets
+    .slice(0, CONFIG.maxDraw)
+    .map((d) => {
+      const cls = d === best ? 'danger' : '';
+      return `<li class="${cls}"><span class="dot" style="background:${d.color}"></span>` +
+        `<b>${d.ko}</b> ${(d.score * 100).toFixed(0)}% · ${DIR_KO[d.dir]} · 근접 ${(d.prox * 100).toFixed(0)}%</li>`;
+    })
+    .join('');
 }
 
-function updatePredictionBars(predictions) {
-  // 예측 결과를 막대 그래프로 업데이트
-  for (let i = 0; i < predictions.length && i < 4; i++) {
-    const prob = predictions[i].probability;
-    const percent = (prob * 100).toFixed(1);
-    
-    const barElement = document.getElementById(`pred-${i}-bar`);
-    const percentElement = document.getElementById(`pred-${i}-percent`);
-    
-    if (barElement && percentElement) {
-      barElement.style.width = `${percent}%`;
-      percentElement.textContent = `${percent}%`;
-      
-      // 평지가 아니고 90% 이상이면 위험 색상
-      const className = predictions[i].className;
-      if (className !== '평지' && prob >= 0.90) {
-        barElement.classList.add('danger');
-      } else {
-        barElement.classList.remove('danger');
-      }
-    }
-  }
-}
-
-function stopLoop() {
-  isRunning = false;
-  stopVibration();
-  setStatus('정지됨');
-  if (animationHandle) cancelAnimationFrame(animationHandle);
-}
-
-ui.btnCamera.addEventListener('click', openCamera);
-ui.btnStart.addEventListener('click', inferenceLoop);
-ui.btnStop.addEventListener('click', stopLoop);
-
-// ============================================
-// 드래그 가능한 Floating Indicator 기능
-// ============================================
-let isDragging = false;
-let dragStartX = 0;
-let dragStartY = 0;
-let indicatorStartX = 0;
-let indicatorStartY = 0;
-
-// 마우스 이벤트
-ui.floatingIndicator.addEventListener('mousedown', (e) => {
-  isDragging = true;
-  dragStartX = e.clientX;
-  dragStartY = e.clientY;
-  const rect = ui.floatingIndicator.getBoundingClientRect();
-  indicatorStartX = rect.left;
-  indicatorStartY = rect.top;
-  ui.floatingIndicator.classList.add('dragging');
-  e.preventDefault();
-});
-
-document.addEventListener('mousemove', (e) => {
-  if (!isDragging) return;
-  const deltaX = e.clientX - dragStartX;
-  const deltaY = e.clientY - dragStartY;
-  ui.floatingIndicator.style.left = (indicatorStartX + deltaX) + 'px';
-  ui.floatingIndicator.style.top = (indicatorStartY + deltaY) + 'px';
-  ui.floatingIndicator.style.right = 'auto';
-});
-
-document.addEventListener('mouseup', () => {
-  if (isDragging) {
-    isDragging = false;
-    ui.floatingIndicator.classList.remove('dragging');
-  }
-});
-
-// 터치 이벤트 (모바일)
-ui.floatingIndicator.addEventListener('touchstart', (e) => {
-  isDragging = true;
-  const touch = e.touches[0];
-  dragStartX = touch.clientX;
-  dragStartY = touch.clientY;
-  const rect = ui.floatingIndicator.getBoundingClientRect();
-  indicatorStartX = rect.left;
-  indicatorStartY = rect.top;
-  ui.floatingIndicator.classList.add('dragging');
-  e.preventDefault();
-});
-
-document.addEventListener('touchmove', (e) => {
-  if (!isDragging) return;
-  const touch = e.touches[0];
-  const deltaX = touch.clientX - dragStartX;
-  const deltaY = touch.clientY - dragStartY;
-  ui.floatingIndicator.style.left = (indicatorStartX + deltaX) + 'px';
-  ui.floatingIndicator.style.top = (indicatorStartY + deltaY) + 'px';
-  ui.floatingIndicator.style.right = 'auto';
-  e.preventDefault();
-});
-
-document.addEventListener('touchend', () => {
-  if (isDragging) {
-    isDragging = false;
-    ui.floatingIndicator.classList.remove('dragging');
-  }
-});
-
-// Floating Indicator 상태 업데이트 함수
 function updateFloatingIndicator(isDanger) {
   if (isDanger) {
     ui.floatingIndicator.classList.add('danger');
@@ -348,91 +442,150 @@ function updateFloatingIndicator(isDanger) {
   }
 }
 
-// 디버그: 스크립트 실행 확인
-console.log('=== main.js 스크립트 로드됨 ===');
-console.log('window 객체:', typeof window);
-console.log('document 객체:', typeof document);
+// ============================================
+// 추론 루프 (이전 추론이 끝난 뒤 다음 프레임 처리 → 겹치지 않음)
+// ============================================
+const perf = { ms: 0, frames: 0, lastReport: 0 };
 
-// 페이지 로드 시 자동으로 모델 로드
-let appInitialized = false;
-
-function checkLibraryAndInit() {
-  if (appInitialized) return;
-  appInitialized = true;
-  
-  console.log('=== 초기화 시작 ===');
-  console.log('tf 타입:', typeof tf);
-  console.log('tmImage 타입:', typeof tmImage);
-  
-  log('앱 시작됨');
-  setStatus('초기화 중...');
-  
-  // TensorFlow.js 확인
-  if (typeof tf === 'undefined') {
-    log('✗ TensorFlow.js 로드 실패');
-    console.error('TensorFlow.js가 로드되지 않았습니다.');
-    setStatus('TF.js 로드 실패');
+async function inferenceLoop() {
+  if (!session || !(webcamStream || testImage)) {
+    log('✗ 모델 또는 카메라가 준비되지 않았습니다.');
     return;
   }
-  
-  log('✓ TensorFlow.js 로드 완료');
-  
-  // Teachable Machine 확인
-  if (typeof tmImage === 'undefined') {
-    log('✗ Teachable Machine 라이브러리 로드 실패');
-    console.error('Teachable Machine 라이브러리가 로드되지 않았습니다.');
-    setStatus('tmImage 로드 실패');
-    return;
-  }
-  
-  log('✓ Teachable Machine 라이브러리 로드 완료');
-  log('모델을 자동으로 로드합니다...');
-  setStatus('모델 로딩 중...');
-  loadModel();
+  if (isRunning) return;
+  isRunning = true;
+  setStatus('감지 중...');
+  log('감지 시작됨');
+  const ctx = ui.overlay.getContext('2d');
+
+  const step = async () => {
+    if (!isRunning) return;
+    const t0 = performance.now();
+    try {
+      const src = frameSource();
+      const vw = src.w;
+      const vh = src.h;
+      if (vw && vh) {
+        if (ui.overlay.width !== vw) {
+          ui.overlay.width = vw;
+          ui.overlay.height = vh;
+        }
+        const conf = parseFloat(ui.threshold.value) || 0.5;
+        const requiredFrames = parseInt(ui.steadyFrames.value, 10) || 3;
+        const minProximity = parseFloat(ui.proximity.value) || 0.2;
+
+        const lb = preprocess(src, inputSize);
+        const result = await session.run({ [inputName]: lb.tensor });
+        const dets = postprocess(result[outputName], lb, conf, vw, vh);
+        const best = assess(dets, vw, vh, minProximity);
+        const confirmed = updateHysteresis(best ? best.label : null, requiredFrames);
+
+        drawDetections(ctx, dets, best);
+        updateDetectionList(dets, best);
+        updateFloatingIndicator(!!confirmed);
+
+        if (confirmed && best) vibrateFor(best);
+        else stopVibration();
+      }
+    } catch (e) {
+      console.error('추론 오류:', e);
+      log(`감지 오류: ${e.message}`);
+      stopLoop();
+      return;
+    }
+    // 성능 표시
+    perf.ms = perf.ms * 0.8 + (performance.now() - t0) * 0.2;
+    perf.frames += 1;
+    if (performance.now() - perf.lastReport > 1000) {
+      perf.lastReport = performance.now();
+      setStatus(`감지 중 · ${Math.round(perf.ms)}ms/프레임 (${(1000 / Math.max(1, perf.ms)).toFixed(1)} FPS)`);
+    }
+    animationHandle = requestAnimationFrame(step);
+  };
+  step();
 }
 
-// 페이지 로드 후 초기화 및 자동 시작
-console.log('=== 이벤트 리스너 등록 ===');
-window.addEventListener('load', () => {
-  console.log('=== window.load 이벤트 발생 ===');
-  setTimeout(async () => {
-    console.log('=== 3초 대기 후 초기화 시작 ===');
-    checkLibraryAndInit();
-    
-    // 모델 로드 대기
-    await waitForModelLoad();
-    
-    // 자동으로 카메라 시작
-    log('🤖 자동 시작 모드 활성화');
-    await openCamera();
-    
-    // 카메라 시작 후 잠시 대기하고 자동으로 감지 시작
-    setTimeout(() => {
-      if (webcamStream && model) {
-        log('🚀 자동으로 감지를 시작합니다...');
-        inferenceLoop();
-      }
-    }, 1000);
-  }, 3000);
+function stopLoop() {
+  isRunning = false;
+  stopVibration();
+  updateFloatingIndicator(false);
+  setStatus('정지됨');
+  if (animationHandle) cancelAnimationFrame(animationHandle);
+}
+
+ui.btnCamera.addEventListener('click', openCamera);
+ui.btnStart.addEventListener('click', inferenceLoop);
+ui.btnStop.addEventListener('click', stopLoop);
+
+// ============================================
+// 드래그 가능한 Floating Indicator
+// ============================================
+let isDragging = false;
+let dragStartX = 0;
+let dragStartY = 0;
+let indicatorStartX = 0;
+let indicatorStartY = 0;
+
+function beginDrag(clientX, clientY) {
+  isDragging = true;
+  dragStartX = clientX;
+  dragStartY = clientY;
+  const rect = ui.floatingIndicator.getBoundingClientRect();
+  indicatorStartX = rect.left;
+  indicatorStartY = rect.top;
+  ui.floatingIndicator.classList.add('dragging');
+}
+
+function moveDrag(clientX, clientY) {
+  if (!isDragging) return;
+  ui.floatingIndicator.style.left = indicatorStartX + (clientX - dragStartX) + 'px';
+  ui.floatingIndicator.style.top = indicatorStartY + (clientY - dragStartY) + 'px';
+  ui.floatingIndicator.style.right = 'auto';
+}
+
+function endDrag() {
+  if (!isDragging) return;
+  isDragging = false;
+  ui.floatingIndicator.classList.remove('dragging');
+}
+
+ui.floatingIndicator.addEventListener('mousedown', (e) => {
+  beginDrag(e.clientX, e.clientY);
+  e.preventDefault();
 });
+document.addEventListener('mousemove', (e) => moveDrag(e.clientX, e.clientY));
+document.addEventListener('mouseup', endDrag);
+ui.floatingIndicator.addEventListener('touchstart', (e) => {
+  beginDrag(e.touches[0].clientX, e.touches[0].clientY);
+  e.preventDefault();
+});
+document.addEventListener('touchmove', (e) => {
+  if (!isDragging) return;
+  moveDrag(e.touches[0].clientX, e.touches[0].clientY);
+  e.preventDefault();
+}, { passive: false });
+document.addEventListener('touchend', endDrag);
 
-// 모델이 로드될 때까지 대기하는 헬퍼 함수
-function waitForModelLoad() {
-  return new Promise((resolve) => {
-    const checkInterval = setInterval(() => {
-      if (model) {
-        clearInterval(checkInterval);
-        resolve();
-      }
-    }, 100);
-    
-    // 최대 30초 대기
-    setTimeout(() => {
-      clearInterval(checkInterval);
-      resolve();
-    }, 30000);
-  });
-}
-
-
-
+// ============================================
+// 자동 시작: 모델 로드 → 카메라 → 감지
+// ============================================
+window.addEventListener('load', async () => {
+  log('앱 시작됨');
+  if (typeof ort === 'undefined') {
+    log('✗ ONNX Runtime Web 로드 실패 (인터넷 연결 확인)');
+    setStatus('ORT 로드 실패');
+    return;
+  }
+  log(`✓ ONNX Runtime Web ${ort.env.versions ? ort.env.versions.web || '' : ''} 로드 완료`);
+  await loadModel();
+  const imageUrl = new URLSearchParams(location.search).get('image');
+  if (imageUrl) {
+    await loadTestImage(imageUrl);
+  } else {
+    await openCamera();
+  }
+  if (session && (webcamStream || testImage)) {
+    log('🚀 자동으로 감지를 시작합니다...');
+    inferenceLoop();
+  }
+});
