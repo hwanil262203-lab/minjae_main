@@ -36,3 +36,6 @@ build/
 *.tgz
 *.zip
 
+
+# 학습 데이터 (로컬 병합 결과)
+datasets/
