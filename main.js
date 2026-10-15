@@ -371,13 +371,51 @@ function updateHysteresis(currentLabel, requiredFrames) {
 }
 
 // ============================================
+// 사용자 설정 (localStorage 에 저장)
+// ============================================
+const SETTINGS_KEY = 'hazard-settings-v1';
+const settings = {
+  vibStrength: 'mid', // weak | mid | strong
+  flash: true, // 위험 알림 중 화면 깜빡임
+  flashLevel: 'light', // light | mid | strong
+  onboarded: false, // 첫 접속 안내를 봤는지
+};
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) Object.assign(settings, JSON.parse(raw));
+  } catch (_) {
+    /* 사생활 모드 등에서는 무시 */
+  }
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  } catch (_) {
+    /* 무시 */
+  }
+}
+
+const VIB_STRENGTH = {
+  // 웹 진동 API 는 강도 조절이 없어 펄스 길이·반복 간격으로 흉내 낸다
+  weak: { scale: 0.5, repeatMs: 2200 },
+  mid: { scale: 1.0, repeatMs: 1500 },
+  strong: { scale: 1.6, repeatMs: 1000 },
+};
+const FLASH_OPACITY = { light: 0.22, mid: 0.38, strong: 0.55 };
+
+// ============================================
 // 진동: 방향 = 펄스 개수(좌1/정면2/우3), 근접 = 펄스 길이(가까움 150ms / 보통 350ms)
 // ============================================
 const vib = { key: null, t: 0 };
+const canVibrate = 'vibrate' in navigator;
 
-function vibrationPattern(dir, near) {
+function vibrationPattern(dir, near, strength = settings.vibStrength) {
+  const s = VIB_STRENGTH[strength] || VIB_STRENGTH.mid;
   const pulses = dir === 'left' ? 1 : dir === 'center' ? 2 : 3;
-  const len = near ? 150 : 350;
+  const len = Math.round((near ? 150 : 350) * s.scale);
   const gap = 120;
   const pattern = [];
   for (let i = 0; i < pulses; i++) {
@@ -388,20 +426,51 @@ function vibrationPattern(dir, near) {
 }
 
 function vibrateFor(det) {
-  if (!('vibrate' in navigator)) return;
   const key = `${det.label}|${det.dir}|${det.near}`;
   const now = performance.now();
-  if (key !== vib.key || now - vib.t > CONFIG.vibrateRepeatMs) {
-    navigator.vibrate(vibrationPattern(det.dir, det.near));
+  const repeatMs = (VIB_STRENGTH[settings.vibStrength] || VIB_STRENGTH.mid).repeatMs;
+  if (key !== vib.key || now - vib.t > repeatMs) {
+    if (canVibrate) navigator.vibrate(vibrationPattern(det.dir, det.near));
     vib.key = key;
     vib.t = now;
   }
+  setFlash(true);
 }
 
 function stopVibration() {
-  if (vib.key && 'vibrate' in navigator) navigator.vibrate(0);
+  if (vib.key && canVibrate) navigator.vibrate(0);
   vib.key = null;
   vib.t = 0;
+  setFlash(false);
+}
+
+// 화면 깜빡임 (진동 모드/무음 대비)
+const flashOverlay = document.getElementById('flashOverlay');
+
+function setFlash(on) {
+  if (!flashOverlay) return;
+  if (on && settings.flash) {
+    flashOverlay.style.setProperty('--flash-opacity', FLASH_OPACITY[settings.flashLevel] || FLASH_OPACITY.light);
+    flashOverlay.classList.add('active');
+  } else {
+    flashOverlay.classList.remove('active');
+  }
+}
+
+function testVibration() {
+  if (!canVibrate) return false;
+  // 정면·가까움 패턴 (2회) 으로 체감
+  return navigator.vibrate(vibrationPattern('center', true));
+}
+
+function testFlash() {
+  const prev = settings.flash;
+  settings.flash = true;
+  setFlash(true);
+  setTimeout(() => {
+    setFlash(false);
+    settings.flash = prev;
+  }, 2000);
 }
 
 // ============================================
@@ -451,17 +520,39 @@ function updateDetectionList(dets, best) {
     .join('');
 }
 
-function updateFloatingIndicator(isDanger) {
-  if (isDanger) {
-    ui.floatingIndicator.classList.add('danger');
-    ui.floatingIndicator.textContent = '⚠';
-    ui.floatingIndicator.title = '위험 감지됨! (드래그하여 이동 가능)';
-  } else {
-    ui.floatingIndicator.classList.remove('danger');
-    ui.floatingIndicator.textContent = '✓';
-    ui.floatingIndicator.title = '안전 상태 (드래그하여 이동 가능)';
-  }
+// 상태 인디케이터: ok(초록 ✓) / warn(노랑 !) / danger(빨강 !)
+const INDICATOR = {
+  ok: { cls: '', text: '✓', title: '정상 작동 중 (드래그하여 이동 가능)' },
+  warn: { cls: 'warn', text: '!', title: '비정상: 감지가 동작하지 않습니다 (드래그하여 이동 가능)' },
+  danger: { cls: 'danger', text: '!', title: '위험 감지됨! (드래그하여 이동 가능)' },
+};
+let indicatorState = null;
+
+function setIndicator(state) {
+  if (state === indicatorState) return;
+  indicatorState = state;
+  const s = INDICATOR[state] || INDICATOR.warn;
+  ui.floatingIndicator.classList.remove('warn', 'danger');
+  if (s.cls) ui.floatingIndicator.classList.add(s.cls);
+  ui.floatingIndicator.textContent = s.text;
+  ui.floatingIndicator.title = s.title;
 }
+
+// 정상 작동 감시: 감지 루프가 멈추거나 프레임이 오래 끊기면 노랑
+const health = { lastFrameTs: 0, danger: false };
+
+function updateFloatingIndicator(isDanger) {
+  health.danger = isDanger;
+  refreshIndicator();
+}
+
+function refreshIndicator() {
+  if (health.danger) return setIndicator('danger');
+  const alive = isRunning && session && performance.now() - health.lastFrameTs < 4000;
+  setIndicator(alive ? 'ok' : 'warn');
+}
+
+setInterval(refreshIndicator, 1000);
 
 // ============================================
 // 추론 루프 (이전 추론이 끝난 뒤 다음 프레임 처리 → 겹치지 않음)
@@ -507,6 +598,7 @@ async function inferenceLoop() {
 
         if (confirmed && best) vibrateFor(best);
         else stopVibration();
+        health.lastFrameTs = performance.now();
       }
     } catch (e) {
       console.error('추론 오류:', e);
@@ -588,9 +680,105 @@ document.addEventListener('touchmove', (e) => {
 document.addEventListener('touchend', endDrag);
 
 // ============================================
-// 자동 시작: 모델 로드 → 카메라 → 감지
+// 시작 안내 창 + 설정 창
+// ============================================
+const panels = {
+  start: document.getElementById('startOverlay'),
+  settings: document.getElementById('settingsPanel'),
+};
+
+function syncSettingsUI() {
+  document.querySelectorAll('input[name="vibStrength"]').forEach((r) => (r.checked = r.value === settings.vibStrength));
+  document.querySelectorAll('input[name="flashLevel"]').forEach((r) => (r.checked = r.value === settings.flashLevel));
+  document.getElementById('flashToggle').checked = settings.flash;
+  document.getElementById('startFlashToggle').checked = settings.flash;
+}
+
+function bindSettingsUI() {
+  document.querySelectorAll('input[name="vibStrength"]').forEach((r) =>
+    r.addEventListener('change', () => {
+      if (r.checked) {
+        settings.vibStrength = r.value;
+        saveSettings();
+      }
+    })
+  );
+  document.querySelectorAll('input[name="flashLevel"]').forEach((r) =>
+    r.addEventListener('change', () => {
+      if (r.checked) {
+        settings.flashLevel = r.value;
+        saveSettings();
+      }
+    })
+  );
+  document.getElementById('flashToggle').addEventListener('change', (e) => {
+    settings.flash = e.target.checked;
+    saveSettings();
+    if (!settings.flash) setFlash(false);
+  });
+  document.getElementById('btnVibTest').addEventListener('click', () => {
+    if (!testVibration()) log('진동을 지원하지 않거나 차단된 기기입니다.');
+  });
+  document.getElementById('btnFlashTest').addEventListener('click', testFlash);
+  document.getElementById('btnSettings').addEventListener('click', () => {
+    syncSettingsUI();
+    panels.settings.hidden = false;
+  });
+  document.getElementById('btnSettingsClose').addEventListener('click', () => {
+    panels.settings.hidden = true;
+  });
+
+  // 시작 안내 창
+  const vibResult = document.getElementById('vibTestResult');
+  if (!canVibrate) {
+    document.getElementById('noVibrateNote').hidden = false;
+    document.getElementById('btnVibTestStart').disabled = true;
+    vibResult.textContent = '이 기기는 진동 미지원';
+  }
+  document.getElementById('btnVibTestStart').addEventListener('click', () => {
+    const ok = testVibration();
+    vibResult.textContent = ok
+      ? '진동이 느껴지지 않으면 무음 모드를 진동 모드로 바꿔 주세요'
+      : '진동이 차단되어 있습니다. 화면 깜빡임을 켜 두세요';
+  });
+  document.getElementById('btnStartApp').addEventListener('click', startApp);
+}
+
+function showStartOverlay() {
+  panels.start.classList.toggle('first', !settings.onboarded);
+  panels.start.classList.toggle('compact', settings.onboarded);
+  syncSettingsUI();
+  panels.start.hidden = false;
+}
+
+// 사용자의 탭(시작하기) 이후에만 카메라·감지를 시작한다.
+// Chrome 은 사용자가 페이지를 한 번도 누르지 않으면 navigator.vibrate 를 막는다.
+async function startApp() {
+  settings.flash = document.getElementById('startFlashToggle').checked;
+  settings.onboarded = true;
+  saveSettings();
+  panels.start.hidden = true;
+
+  const imageUrl = new URLSearchParams(location.search).get('image');
+  if (imageUrl) {
+    if (!testImage) await loadTestImage(imageUrl);
+  } else if (!webcamStream) {
+    await openCamera();
+  }
+  if (session && (webcamStream || testImage)) {
+    log('🚀 감지를 시작합니다...');
+    inferenceLoop();
+  } else {
+    log('✗ 시작 실패: 모델 또는 카메라가 준비되지 않았습니다.');
+  }
+}
+
+// ============================================
+// 초기화: 설정 로드 → 모델 로드 → 시작 안내 창
 // ============================================
 window.addEventListener('load', async () => {
+  loadSettings();
+  bindSettingsUI();
   log('앱 시작됨');
   if (typeof ort === 'undefined') {
     log('✗ ONNX Runtime Web 로드 실패 (인터넷 연결 확인)');
@@ -598,15 +786,6 @@ window.addEventListener('load', async () => {
     return;
   }
   log(`✓ ONNX Runtime Web ${ort.env.versions ? ort.env.versions.web || '' : ''} 로드 완료`);
+  showStartOverlay();
   await loadModel();
-  const imageUrl = new URLSearchParams(location.search).get('image');
-  if (imageUrl) {
-    await loadTestImage(imageUrl);
-  } else {
-    await openCamera();
-  }
-  if (session && (webcamStream || testImage)) {
-    log('🚀 자동으로 감지를 시작합니다...');
-    inferenceLoop();
-  }
 });
