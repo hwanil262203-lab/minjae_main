@@ -86,8 +86,7 @@
         font-size: 13px;
         color: #b7c2d7;
       }
-      input[type="number"],
-      input[type="password"] {
+      input[type="number"] {
         flex: 1;
         min-width: 80px;
         background: #0b1020;
@@ -415,22 +414,6 @@
         <div class="row">
           <button id="btnFlashTest" class="secondary">✨ 깜빡임 테스트 (2초)</button>
         </div>
-
-        <h3>AI 음성 안내 (이어폰 전용)</h3>
-        <p class="notice">🎧 <b>이어폰을 꽂았을 때만 켜세요.</b> 스피커로 재생되면 주변에 소음이 됩니다. 위험을 감지하면 상황을 설명하는 문장을 만들어 음성으로 읽어 줍니다.</p>
-        <label class="toggle">
-          <span>AI 음성 안내 사용</span>
-          <input id="aiVoiceToggle" type="checkbox" />
-        </label>
-        <div class="row">
-          <label>Claude API 키 (선택)</label>
-          <input id="aiKeyInput" type="password" placeholder="sk-ant-... 없으면 규칙 문장 사용" autocomplete="off" />
-        </div>
-        <p style="font-size: 12px; color: #6b7a99; margin: 0;">키는 이 기기에만 저장되며 api.anthropic.com 으로만 전송됩니다. 다른 사람과 함께 쓰는 기기에는 넣지 마세요.</p>
-        <div class="row">
-          <button id="btnAiVoiceTest" class="secondary">🔊 문장 테스트</button>
-        </div>
-        <p id="aiVoiceStatus" style="font-size: 12px; color: #b7c2d7; margin: 0;"></p>
 
         <h3>고급 (감지 민감도)</h3>
         <div class="row">

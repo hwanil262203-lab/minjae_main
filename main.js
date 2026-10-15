@@ -470,8 +470,6 @@ const settings = {
   flash: true, // 위험 알림 중 화면 깜빡임
   flashLevel: 'light', // light | mid | strong
   onboarded: false, // 첫 접속 안내를 봤는지
-  aiVoice: false, // AI 음성 안내 (이어폰 전용, 기본 꺼짐)
-  aiKey: '', // Claude API 키 (선택). 없으면 규칙 문장만 사용
 };
 
 function loadSettings() {
@@ -706,12 +704,8 @@ async function inferenceLoop() {
         updateDetectionList(dets, best);
         updateFloatingIndicator(!!confirmed);
 
-        if (confirmed && best) {
-          vibrateFor(best);
-          announceDanger(best, dets);
-        } else {
-          stopVibration();
-        }
+        if (confirmed && best) vibrateFor(best);
+        else stopVibration();
         health.lastFrameTs = performance.now();
         loopState.consecutiveErrors = 0;
       }
@@ -884,9 +878,6 @@ function syncSettingsUI() {
   document.querySelectorAll('input[name="flashLevel"]').forEach((r) => (r.checked = r.value === settings.flashLevel));
   document.getElementById('flashToggle').checked = settings.flash;
   document.getElementById('startFlashToggle').checked = settings.flash;
-  document.getElementById('aiVoiceToggle').checked = settings.aiVoice;
-  document.getElementById('aiKeyInput').value = settings.aiKey || '';
-  updateAiVoiceStatus();
 }
 
 function bindSettingsUI() {
@@ -910,36 +901,6 @@ function bindSettingsUI() {
     settings.flash = e.target.checked;
     saveSettings();
     if (!settings.flash) setFlash(false);
-  });
-  document.getElementById('aiVoiceToggle').addEventListener('change', (e) => {
-    settings.aiVoice = e.target.checked;
-    saveSettings();
-    if (settings.aiVoice) checkEarphones().then(() => updateAiVoiceStatus());
-    else if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-  });
-  document.getElementById('aiKeyInput').addEventListener('change', (e) => {
-    settings.aiKey = e.target.value.trim();
-    saveSettings();
-    updateAiVoiceStatus();
-  });
-  document.getElementById('btnAiVoiceTest').addEventListener('click', async () => {
-    const sample = { label: 'stairs', ko: '계단', dir: 'center', near: true, score: 0.8, risk: 1, prox: 0.6 };
-    const text = dangerSentence(sample, [sample]);
-    speakAlert(text);
-    updateAiVoiceStatus(`규칙 문장: ${text}`);
-    if ((settings.aiKey || '').trim()) {
-      try {
-        const t = await requestAiSentence(buildAiContext(sample, [sample]));
-        if (t) {
-          speakAlert(t);
-          updateAiVoiceStatus(`AI 문장: ${t}`);
-        } else {
-          updateAiVoiceStatus('AI 가 문장을 만들지 않았습니다');
-        }
-      } catch (e) {
-        updateAiVoiceStatus(`AI 호출 실패: ${e.name === 'AbortError' ? '시간 초과' : e.message}`);
-      }
-    }
   });
   document.getElementById('btnVibTest').addEventListener('click', () => {
     if (!testVibration()) log('진동을 지원하지 않거나 차단된 기기입니다.');
@@ -979,7 +940,6 @@ async function startApp() {
   } else if (!webcamStream) {
     await openCamera();
   }
-  if (settings.aiVoice) checkEarphones().then(() => updateAiVoiceStatus());
   // 모델이 아직 없으면(로드 실패·지연) 한 번 더 시도
   if (!session && !modelLoading) await loadModel();
   if (session && (webcamStream || testImage)) {
@@ -1009,173 +969,3 @@ window.addEventListener('load', async () => {
   showStartOverlay();
   await loadModel();
 });
-
-
-// ============================================
-// AI 음성 안내 (이어폰 전용): 위험 상황을 설명하는 문장을 만들어 TTS 로 읽어 준다
-// - 첫 안내는 지연 없는 규칙 문장, 생성형 AI(Claude) 문장은 받아 두었다가 반복 안내부터 사용
-// - API 키가 없으면 규칙 문장만 사용
-// ============================================
-const AI_VOICE = {
-  model: 'claude-opus-5-5',
-  endpoint: 'https://api.anthropic.com/v1/messages',
-  timeoutMs: 6000,
-  cacheMs: 60000, // 같은 상황의 AI 문장 재사용 시간
-  repeatMs: 8000, // 같은 위험이 계속되면 이 간격으로 다시 읽음
-};
-const aiVoice = { lastKey: null, lastT: 0, cache: new Map(), pending: new Set(), earphone: { known: false, connected: false }, warned: false };
-
-// 받침 유무에 따른 조사
-function josa(word, withFinal, withoutFinal) {
-  const ch = word.charCodeAt(word.length - 1);
-  if (ch < 0xac00 || ch > 0xd7a3) return withoutFinal;
-  return (ch - 0xac00) % 28 === 0 ? withoutFinal : withFinal;
-}
-
-const ADVICE = {
-  crosswalk: '멈춰서 신호와 차량을 확인하세요.',
-  stairs: '발밑을 보고 천천히 가세요.',
-  pole: '부딪히지 않게 옆으로 피하세요.',
-  person: '사람과 부딪히지 않게 주의하세요.',
-  vehicle: '차량이 가까이 있습니다. 멈추세요.',
-};
-
-// 규칙 기반 문장 (API 키 없이도 동작, 지연 없음)
-function dangerSentence(best, dets) {
-  const dir = DIR_KO[best.dir] || '앞';
-  const where = best.near ? '바로 앞' : '앞쪽';
-  const others = dets
-    .filter((d) => d !== best && d.label !== best.label && (d.risk || 0) > 0.2)
-    .slice(0, 2)
-    .map((d) => d.ko);
-  let s = `${dir} ${where}에 ${best.ko}${josa(best.ko, '이', '가')} 있습니다. ${ADVICE[best.label] || '전방을 확인하세요.'}`;
-  if (others.length) s += ` 주변에 ${others.join('과 ')}도 있습니다.`;
-  return s;
-}
-
-function speakAlert(text) {
-  if (!('speechSynthesis' in window)) return false;
-  try {
-    window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'ko-KR';
-    u.rate = 1.05;
-    window.speechSynthesis.speak(u);
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
-
-// 이어폰 연결 확인: 출력 장치 목록을 주는 기기에서만 판단 가능 (known=false 면 알 수 없음)
-async function checkEarphones() {
-  const result = { known: false, connected: false };
-  try {
-    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-      const devs = await navigator.mediaDevices.enumerateDevices();
-      const outs = devs.filter((d) => d.kind === 'audiooutput' && d.label);
-      if (outs.length) {
-        result.known = true;
-        result.connected = outs.some((d) => /head|ear|bud|pod|이어|헤드|bluetooth|블루투스/i.test(d.label));
-      }
-    }
-  } catch (_) {
-    /* 무시 */
-  }
-  aiVoice.earphone = result;
-  return result;
-}
-if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
-  navigator.mediaDevices.addEventListener('devicechange', () => checkEarphones().then(() => updateAiVoiceStatus()));
-}
-
-function buildAiContext(best, dets) {
-  return {
-    main: { object: best.ko, direction: DIR_KO[best.dir], proximity: best.near ? '가까움' : '접근 중', confidence: Math.round((best.score || 0) * 100) },
-    others: dets.filter((d) => d !== best).slice(0, 3).map((d) => ({ object: d.ko, direction: DIR_KO[d.dir], proximity_percent: Math.round((d.prox || 0) * 100) })),
-    user: '보행 중 스마트폰을 보는 사용자 또는 시각장애인',
-  };
-}
-
-// Claude API 로 한 문장 생성 (브라우저에서 직접 호출)
-async function requestAiSentence(ctx) {
-  const key = (settings.aiKey || '').trim();
-  if (!key) return null;
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), AI_VOICE.timeoutMs);
-  try {
-    const res = await fetch(AI_VOICE.endpoint, {
-      method: 'POST',
-      signal: ctl.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': key,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': 'server-side-fallback-2026-07-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
-      },
-      body: JSON.stringify({
-        model: AI_VOICE.model,
-        max_tokens: 1024,
-        output_config: { effort: 'low' },
-        fallbacks: 'default',
-        system:
-          '너는 보행 중 스마트폰을 보는 사람과 시각장애인을 돕는 안전 안내 음성이다. ' +
-          '카메라가 감지한 위험 정보를 JSON 으로 받으면, 한국어 존댓말로 두 문장 이내(50자 이내)로 위험의 종류·방향·거리를 알리고 바로 할 행동을 지시한다. ' +
-          '숫자·기호·괄호·영어 없이 말하듯이 쓴다. 문장만 출력한다.',
-        messages: [{ role: 'user', content: JSON.stringify(ctx) }],
-      }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    if (data.stop_reason === 'refusal') return null;
-    const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
-    return text || null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function announceDanger(best, dets) {
-  if (!settings.aiVoice || !best) return;
-  const key = `${best.label}|${best.dir}|${best.near}`;
-  const now = performance.now();
-  if (key === aiVoice.lastKey && now - aiVoice.lastT < AI_VOICE.repeatMs) return;
-  aiVoice.lastKey = key;
-  aiVoice.lastT = now;
-  if (aiVoice.earphone.known && !aiVoice.earphone.connected) {
-    if (!aiVoice.warned) {
-      aiVoice.warned = true;
-      log('🔇 이어폰이 감지되지 않아 AI 음성 안내를 하지 않습니다');
-    }
-    return;
-  }
-  const cached = aiVoice.cache.get(key);
-  const text = cached && now - cached.t < AI_VOICE.cacheMs ? cached.text : dangerSentence(best, dets);
-  speakAlert(text);
-  log(`🔊 ${text}`);
-  if ((settings.aiKey || '').trim() && !cached && !aiVoice.pending.has(key)) {
-    aiVoice.pending.add(key);
-    requestAiSentence(buildAiContext(best, dets))
-      .then((t) => {
-        if (t) {
-          aiVoice.cache.set(key, { text: t, t: performance.now() });
-          log(`🤖 AI 문장 준비: ${t}`);
-        }
-      })
-      .catch((e) => log(`AI 문장 생성 실패: ${e.name === 'AbortError' ? '시간 초과' : e.message}`))
-      .finally(() => aiVoice.pending.delete(key));
-  }
-}
-
-function updateAiVoiceStatus(extra) {
-  const el = document.getElementById('aiVoiceStatus');
-  if (!el) return;
-  const e = aiVoice.earphone;
-  const ear = !e.known
-    ? '이어폰 연결 여부를 이 기기에서는 확인할 수 없습니다. 이어폰을 꽂은 뒤에만 켜 주세요.'
-    : e.connected ? '이어폰 연결됨 ✓' : '이어폰이 감지되지 않아 안내가 울리지 않습니다.';
-  const tts = 'speechSynthesis' in window ? '' : ' 이 브라우저는 음성 합성을 지원하지 않습니다.';
-  const ai = (settings.aiKey || '').trim() ? 'Claude API 로 문장 생성' : '규칙 문장 사용 (API 키 없음)';
-  el.textContent = `${ear}${tts} · ${ai}${extra ? ' · ' + extra : ''}`;
-}
