@@ -21,7 +21,7 @@
 1. 스마트폰 브라우저(Chrome/Safari)에서 배포된 URL 접속
 2. **📷 카메라 시작** 클릭 → 카메라 권한 허용
 3. **▶️ 감지 시작** 클릭
-4. 스마트폰을 전방으로 향하게 유지
+4. 스마트폰을 전방으로 향하게 유지 (학습된 `best.onnx` 가 없으면 시험용 COCO 모델로 동작)
 5. 위험 감지 시 자동으로 진동 발생!
 
 ## 🛠️ 기술 스택
@@ -81,7 +81,8 @@ http://localhost:8000
 - **모델 파일**: `best.onnx` + `labels.json` (Colab 노트북 `tools/train_colab.ipynb` 로 생성)
 - **입력 크기**: 320x320 pixels (letterbox)
 - **클래스**: crosswalk, stairs, pole, person, vehicle
-- **테스트 모드**: `index.html?model=다른모델.onnx&labels=labels_coco.json&image=사진.jpg` 로 카메라 없이 정지 이미지 검사 가능
+- **시험용 모델**: `best.onnx` 가 없으면 자동으로 `yolov10n.onnx`(COCO 80클래스 사전학습, [onnx-community/yolov10n](https://huggingface.co/onnx-community/yolov10n), AGPL-3.0)를 대신 불러온다. 화면의 엔진 표시에 "시험용 모델"이 붙는다
+- **테스트 모드**: `index.html?image=samples/street2.jpg` 처럼 카메라 없이 정지 이미지로 검사 가능 (`?model=`, `?labels=` 로 모델/라벨 파일도 바꿀 수 있음)
 - 이전 Teachable Machine 모델 파일(`model.json`, `weights.bin`, `metadata.json`)은 새 모델 검증 후 삭제 예정
 
 ## 🐛 문제 해결

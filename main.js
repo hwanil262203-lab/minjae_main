@@ -10,6 +10,9 @@ const CONFIG = {
   // ?model=yolo11n.onnx 처럼 주소로 모델 파일을 바꿔 테스트할 수 있다
   modelUrl: new URLSearchParams(location.search).get('model') || './best.onnx',
   labelsUrl: new URLSearchParams(location.search).get('labels') || './labels.json',
+  // best.onnx 가 없을 때 자동으로 쓰는 시험용 모델 (YOLOv10n, COCO 80클래스 사전학습)
+  fallbackModelUrl: './yolov10n.onnx',
+  fallbackLabelsUrl: './labels_coco.json',
   ortVersion: '1.30.0',
   nmsIou: 0.45,
   maxDraw: 8,
@@ -61,6 +64,7 @@ let inputName = null;
 let outputName = null;
 let inputSize = 640;
 let engineName = '-';
+let usingFallbackModel = false;
 let webcamStream = null;
 let testImage = null; // ?image=... 로 지정한 정지 이미지 (카메라 없이 테스트)
 let isRunning = false;
@@ -151,14 +155,30 @@ async function loadModel() {
     } catch (_) {
       /* 무시 */
     }
-    log(`모델 파일: ${CONFIG.modelUrl}`);
+    // 모델 파일이 없으면(아직 학습 전) 시험용 사전학습 모델로 대체
+    let modelUrl = CONFIG.modelUrl;
+    try {
+      const head = await fetch(modelUrl, { method: 'HEAD', cache: 'no-store' });
+      if (!head.ok) throw new Error(`HTTP ${head.status}`);
+    } catch (e) {
+      log(`⚠ ${modelUrl} 없음 (${e.message}) → 시험용 모델 ${CONFIG.fallbackModelUrl} 사용`);
+      modelUrl = CONFIG.fallbackModelUrl;
+      usingFallbackModel = true;
+      try {
+        const r = await fetch(CONFIG.fallbackLabelsUrl, { cache: 'no-store' });
+        if (r.ok) labels = { ...labels, ...(await r.json()) };
+      } catch (_) {
+        /* 무시 */
+      }
+    }
+    log(`모델 파일: ${modelUrl}`);
 
     // WebGPU 우선, 실패하면 WASM
     const providers = navigator.gpu ? ['webgpu', 'wasm'] : ['wasm'];
     let lastErr = null;
     for (const ep of providers) {
       try {
-        session = await ort.InferenceSession.create(CONFIG.modelUrl, {
+        session = await ort.InferenceSession.create(modelUrl, {
           executionProviders: [ep],
           graphOptimizationLevel: 'all',
         });
@@ -188,10 +208,11 @@ async function loadModel() {
     const nmsInModel = od.length === 3 && od[2] === 6;
     labels.nms_in_model = nmsInModel;
 
-    ui.engine.textContent = `${engineName.toUpperCase()} · ${inputSize}px · NMS ${nmsInModel ? '내장' : 'JS'}`;
+    ui.engine.textContent = `${engineName.toUpperCase()} · ${inputSize}px · NMS ${nmsInModel ? '내장' : 'JS'}` +
+      (usingFallbackModel ? ' · 시험용 모델' : '');
     log(`✓ 모델 로드 완료 (${engineName}, 입력 ${inputSize}px, 출력 [${od.join(',')}], 워밍업 ${Math.round(performance.now() - t0)}ms)`);
     log(`클래스: ${labels.names.join(', ') || '(labels.json 없음)'}`);
-    setStatus('모델 준비 완료');
+    setStatus(usingFallbackModel ? '시험용 모델 준비 완료' : '모델 준비 완료');
   } catch (e) {
     log(`✗ 모델 로드 실패: ${e.message}`);
     console.error('모델 로드 오류:', e);
@@ -470,7 +491,7 @@ async function inferenceLoop() {
           ui.overlay.width = vw;
           ui.overlay.height = vh;
         }
-        const conf = parseFloat(ui.threshold.value) || 0.5;
+        const conf = parseFloat(ui.threshold.value) || 0.25;
         const requiredFrames = parseInt(ui.steadyFrames.value, 10) || 3;
         const minProximity = parseFloat(ui.proximity.value) || 0.2;
 

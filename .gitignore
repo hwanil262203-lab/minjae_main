@@ -39,3 +39,5 @@ build/
 
 # 학습 데이터 (로컬 병합 결과)
 datasets/
+
+# 학습 산출물 best.onnx 는 커밋 대상 (시험용 yolov10n.onnx 도 포함)
