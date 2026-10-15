@@ -22,6 +22,8 @@ const CONFIG = {
   loadTimeoutMs: 60000, // 모델 로드·워밍업 제한 시간
   maxConsecutiveErrors: 3, // 연속 오류가 이만큼이면 세션 재생성
   maxRecoveries: 3, // 재생성 시도 한도 (넘으면 정지 후 '모델 로드' 버튼 안내)
+  modelLoadAttempts: 30, // 모델 로드 자동 재시도 횟수
+  modelLoadRetryMs: 3000, // 재시도 간격
 };
 
 // 클래스별 한국어 이름, 위험 가중치(0~1), 색. 키는 labels.json 의 영어 이름.
@@ -289,6 +291,42 @@ async function createSession(modelUrl, providers) {
     }
   }
   throw lastErr || new Error('세션 생성 실패');
+}
+
+// 모델이 로드될 때까지 반복 시도. 한도를 넘으면 오류 창을 띄운다.
+let modelRetryPromise = null;
+
+function showErrorModal(text) {
+  const m = document.getElementById('errorModal');
+  if (!m) return;
+  document.getElementById('errorModalText').textContent = text;
+  m.hidden = false;
+}
+
+function ensureModel(maxAttempts = CONFIG.modelLoadAttempts, delayMs = CONFIG.modelLoadRetryMs) {
+  if (session) return Promise.resolve(true);
+  if (modelRetryPromise) return modelRetryPromise; // 이미 재시도 중이면 그 결과를 함께 기다림
+  modelRetryPromise = (async () => {
+    try {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (session) return true;
+        if (attempt > 1) {
+          setStatus(`모델 로드 재시도 ${attempt}/${maxAttempts}...`);
+          log(`모델 로드 재시도 ${attempt}/${maxAttempts}`);
+        }
+        const ok = await loadModel();
+        if (ok && session) return true;
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+      log(`✗ 모델 로드 ${maxAttempts}회 실패`);
+      setStatus('모델 로드 실패');
+      showErrorModal('모델 로드에 실패했습니다. 다시 접속하여 주십시오.');
+      return false;
+    } finally {
+      modelRetryPromise = null;
+    }
+  })();
+  return modelRetryPromise;
 }
 
 // 추론이 멈추거나 오류가 반복되면 세션을 새로 만든다 (WebGPU 가 문제면 WASM 으로 내려감)
@@ -812,7 +850,8 @@ setInterval(() => {
 }, 2000);
 
 ui.btnCamera.addEventListener('click', openCamera);
-ui.btnLoadModel.addEventListener('click', () => loadModel({ force: !!session }));
+ui.btnLoadModel.addEventListener('click', () => (session ? loadModel({ force: true }) : ensureModel()));
+document.getElementById('btnErrorReload').addEventListener('click', () => location.reload());
 ui.btnStart.addEventListener('click', inferenceLoop);
 ui.btnStop.addEventListener('click', stopLoop);
 
@@ -941,7 +980,7 @@ async function startApp() {
     await openCamera();
   }
   // 모델이 아직 없으면(로드 실패·지연) 한 번 더 시도
-  if (!session && !modelLoading) await loadModel();
+  if (!session) await ensureModel();
   if (session && (webcamStream || testImage)) {
     log('🚀 감지를 시작합니다...');
     inferenceLoop();
@@ -967,5 +1006,5 @@ window.addEventListener('load', async () => {
   }
   log(`✓ ONNX Runtime Web ${ort.env.versions ? ort.env.versions.web || '' : ''} 로드 완료`);
   showStartOverlay();
-  await loadModel();
+  await ensureModel();
 });
