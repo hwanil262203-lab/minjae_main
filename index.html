@@ -425,6 +425,10 @@
         </div>
 
         <h3>고급 (감지 민감도)</h3>
+        <label class="toggle">
+          <span>GPU 가속(WebGPU) 사용 — 이 기기에서 실패하면 자동으로 꺼짐</span>
+          <input id="webgpuToggle" type="checkbox" checked />
+        </label>
         <div class="row">
           <label>신뢰도 임계치</label>
           <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.25" />
@@ -465,6 +469,7 @@
           <div class="row">
             <div class="badge" id="status">초기화 중...</div>
             <div class="badge" id="engine">엔진: -</div>
+            <button id="btnCopyLog" class="secondary" style="padding: 4px 8px; font-size: 12px;">📋 로그 복사</button>
           </div>
           <div class="log" id="log"></div>
         </aside>

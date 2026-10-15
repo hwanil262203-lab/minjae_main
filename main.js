@@ -21,7 +21,8 @@ const CONFIG = {
   frameTimeoutMs: 8000, // 한 프레임 추론이 이보다 오래 걸리면 멈춘 것으로 보고 세션 재생성
   loadTimeoutMs: 60000, // 모델 로드·워밍업 제한 시간
   maxConsecutiveErrors: 3, // 연속 오류가 이만큼이면 세션 재생성
-  maxRecoveries: 3, // 재생성 시도 한도 (넘으면 정지 후 '모델 로드' 버튼 안내)
+  maxRecoveries: 3, // 빠른 세션 재생성 한도 (넘으면 모델 전체 재로드)
+  maxTotalRecoveries: 30, // 전체 재로드 한도 (넘으면 오류 창)
   modelLoadAttempts: 30, // 모델 로드 자동 재시도 횟수
   modelLoadRetryMs: 3000, // 재시도 간격
 };
@@ -200,7 +201,8 @@ async function loadModel(opts = {}) {
     log(`모델 파일: ${modelUrl}`);
 
     // WebGPU 우선, 실패하면 WASM. (opts.wasmOnly 면 처음부터 WASM)
-    const providers = opts.providers || (navigator.gpu && !opts.wasmOnly ? ['webgpu', 'wasm'] : ['wasm']);
+    const providers = opts.providers || (navigator.gpu && settings.useWebGpu && !opts.wasmOnly ? ['webgpu', 'wasm'] : ['wasm']);
+    if (navigator.gpu && !settings.useWebGpu) log('이 기기에서는 WebGPU 를 건너뛰고 WASM 으로 실행합니다 (설정에서 바꿀 수 있음)');
     await createSession(modelUrl, providers);
 
     ui.engine.textContent = engineLabel();
@@ -508,6 +510,7 @@ const settings = {
   flash: true, // 위험 알림 중 화면 깜빡임
   flashLevel: 'light', // light | mid | strong
   onboarded: false, // 첫 접속 안내를 봤는지
+  useWebGpu: true, // WebGPU 시도 여부. 기기에서 실패하면 자동으로 false 로 저장
 };
 
 function loadSettings() {
@@ -689,7 +692,7 @@ setInterval(refreshIndicator, 1000);
 const perf = { ms: 0, frames: 0, lastReport: 0 };
 
 // 감지 루프 상태 (멈춤·오류 복구용)
-const loopState = { token: 0, inFlight: false, frameStart: 0, lastTick: 0, consecutiveErrors: 0, recoveries: 0, lastVideoTime: -1, lastVideoChange: 0 };
+const loopState = { token: 0, inFlight: false, frameStart: 0, lastTick: 0, consecutiveErrors: 0, recoveries: 0, totalRecoveries: 0, okStreak: 0, lastVideoTime: -1, lastVideoChange: 0 };
 
 async function inferenceLoop() {
   if (!session) {
@@ -746,20 +749,43 @@ async function inferenceLoop() {
         else stopVibration();
         health.lastFrameTs = performance.now();
         loopState.consecutiveErrors = 0;
+        loopState.okStreak += 1;
+        if (loopState.okStreak === 100) loopState.recoveries = 0; // 한동안 잘 돌면 복구 횟수 초기화
       }
     } catch (e) {
       loopState.consecutiveErrors += 1;
+      loopState.okStreak = 0;
       const msg = String((e && e.message) || e).split('\n')[0];
       console.error('추론 오류:', e);
-      log(`감지 오류 ${loopState.consecutiveErrors}회: ${msg}`);
+      log(`감지 오류 ${loopState.consecutiveErrors}회 (${engineName}): ${msg}`);
       const timedOut = /시간 초과/.test(msg);
-      if (timedOut || loopState.consecutiveErrors >= CONFIG.maxConsecutiveErrors) {
-        const ok = await recoverSession(timedOut ? '추론이 응답하지 않음' : '오류 반복');
+      const gpuErr = engineName === 'webgpu' && /webgpu|kernel|gpu|unsupported/i.test(msg);
+      if (gpuErr && settings.useWebGpu) {
+        settings.useWebGpu = false;
+        saveSettings();
+        log('⚠ 이 기기의 WebGPU 가 모델을 실행하지 못합니다. 앞으로는 처음부터 WASM 으로 실행합니다.');
+      }
+      if (timedOut || gpuErr || loopState.consecutiveErrors >= CONFIG.maxConsecutiveErrors) {
+        const ok = await recoverSession(timedOut ? '추론이 응답하지 않음' : gpuErr ? 'WebGPU 실행 실패' : '오류 반복');
         if (!ok) {
+          // 빠른 복구가 막히면 정지하지 않고 모델 전체를 다시 불러온 뒤 자동으로 재시작
           loopState.inFlight = false;
           stopLoop();
-          setStatus('감지 중단 — 🔄 모델 로드 후 ▶️ 감지 시작을 눌러 주세요');
-          setModelButton('retry');
+          loopState.totalRecoveries += 1;
+          if (loopState.totalRecoveries > CONFIG.maxTotalRecoveries) {
+            setStatus('감지 중단');
+            showErrorModal('감지를 계속할 수 없습니다. 다시 접속하여 주십시오.');
+            return;
+          }
+          setStatus('모델을 다시 불러오는 중...');
+          log(`↻ 모델 전체 재로드 후 자동 재시작 (${loopState.totalRecoveries}/${CONFIG.maxTotalRecoveries})`);
+          loopState.recoveries = 0;
+          const stale = session;
+          session = null; // 기존 세션을 버리고 완전히 새로 불러온다
+          if (stale) stale.release().catch(() => {});
+          ensureModel().then((loaded) => {
+            if (loaded && (webcamStream || testImage)) inferenceLoop();
+          });
           return;
         }
         loopState.consecutiveErrors = 0;
@@ -917,6 +943,7 @@ function syncSettingsUI() {
   document.querySelectorAll('input[name="flashLevel"]').forEach((r) => (r.checked = r.value === settings.flashLevel));
   document.getElementById('flashToggle').checked = settings.flash;
   document.getElementById('startFlashToggle').checked = settings.flash;
+  document.getElementById('webgpuToggle').checked = settings.useWebGpu;
 }
 
 function bindSettingsUI() {
@@ -940,6 +967,20 @@ function bindSettingsUI() {
     settings.flash = e.target.checked;
     saveSettings();
     if (!settings.flash) setFlash(false);
+  });
+  document.getElementById('webgpuToggle').addEventListener('change', (e) => {
+    settings.useWebGpu = e.target.checked;
+    saveSettings();
+    log(`GPU 가속 ${settings.useWebGpu ? '사용' : '사용 안 함'} — 🔄 모델 다시 로드 를 누르면 적용됩니다`);
+  });
+  document.getElementById('btnCopyLog').addEventListener('click', async () => {
+    const text = [navigator.userAgent, ui.engine.textContent, ui.status.textContent, '', ui.log.textContent].join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      log('📋 로그를 복사했습니다. 메시지로 붙여 넣어 보내 주세요.');
+    } catch (_) {
+      window.prompt('아래 내용을 길게 눌러 복사하세요', text);
+    }
   });
   document.getElementById('btnVibTest').addEventListener('click', () => {
     if (!testVibration()) log('진동을 지원하지 않거나 차단된 기기입니다.');
