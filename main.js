@@ -17,6 +17,11 @@ const CONFIG = {
   nmsIou: 0.45,
   maxDraw: 8,
   vibrateRepeatMs: 1500, // 위험이 계속되면 이 간격으로 진동을 다시 울림
+  // 감지 루프 자가 복구
+  frameTimeoutMs: 8000, // 한 프레임 추론이 이보다 오래 걸리면 멈춘 것으로 보고 세션 재생성
+  loadTimeoutMs: 60000, // 모델 로드·워밍업 제한 시간
+  maxConsecutiveErrors: 3, // 연속 오류가 이만큼이면 세션 재생성
+  maxRecoveries: 3, // 재생성 시도 한도 (넘으면 정지 후 '모델 로드' 버튼 안내)
 };
 
 // 클래스별 한국어 이름, 위험 가중치(0~1), 색. 키는 labels.json 의 영어 이름.
@@ -46,6 +51,7 @@ const ui = {
   video: document.getElementById('video'),
   overlay: document.getElementById('overlay'),
   btnCamera: document.getElementById('btnCamera'),
+  btnLoadModel: document.getElementById('btnLoadModel'),
   btnStart: document.getElementById('btnStart'),
   btnStop: document.getElementById('btnStop'),
   threshold: document.getElementById('threshold'),
@@ -143,10 +149,26 @@ async function loadTestImage(url) {
 // ============================================
 // 모델 로드 (ONNX Runtime Web)
 // ============================================
-async function loadModel() {
+async function loadModel(opts = {}) {
+  if (modelLoading) {
+    log('모델을 이미 불러오는 중입니다.');
+    return false;
+  }
+  if (session && !opts.force) {
+    log('모델이 이미 준비되어 있습니다.');
+    return true;
+  }
+  modelLoading = true;
+  setModelButton('loading');
   try {
     setStatus('모델 로딩 중...');
     ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${CONFIG.ortVersion}/dist/`;
+    ort.env.wasm.numThreads = Math.max(1, Math.min(4, navigator.hardwareConcurrency || 1));
+    if (session) {
+      const old = session;
+      session = null;
+      try { await old.release(); } catch (_) { /* 무시 */ }
+    }
 
     // labels.json (없어도 동작: 클래스 이름이 숫자로 표시됨)
     try {
@@ -157,6 +179,7 @@ async function loadModel() {
     }
     // 모델 파일이 없으면(아직 학습 전) 시험용 사전학습 모델로 대체
     let modelUrl = CONFIG.modelUrl;
+    usingFallbackModel = false;
     try {
       const head = await fetch(modelUrl, { method: 'HEAD', cache: 'no-store' });
       if (!head.ok) throw new Error(`HTTP ${head.status}`);
@@ -171,53 +194,121 @@ async function loadModel() {
         /* 무시 */
       }
     }
+    activeModelUrl = modelUrl;
     log(`모델 파일: ${modelUrl}`);
 
-    // WebGPU 우선, 실패하면 WASM
-    const providers = navigator.gpu ? ['webgpu', 'wasm'] : ['wasm'];
-    let lastErr = null;
-    for (const ep of providers) {
-      try {
-        session = await ort.InferenceSession.create(modelUrl, {
-          executionProviders: [ep],
-          graphOptimizationLevel: 'all',
-        });
-        engineName = ep;
-        break;
-      } catch (e) {
-        lastErr = e;
-        log(`${ep} 초기화 실패 → 다음 백엔드 시도 (${e.message.split('\n')[0]})`);
-      }
-    }
-    if (!session) throw lastErr || new Error('세션 생성 실패');
+    // WebGPU 우선, 실패하면 WASM. (opts.wasmOnly 면 처음부터 WASM)
+    const providers = opts.providers || (navigator.gpu && !opts.wasmOnly ? ['webgpu', 'wasm'] : ['wasm']);
+    await createSession(modelUrl, providers);
 
-    inputName = session.inputNames[0];
-    outputName = session.outputNames[0];
-
-    // 입력 크기: 모델 메타데이터 → labels.json → 640 순서로 결정
-    inputSize = labels.imgsz || 640;
-    const meta = session.inputMetadata && session.inputMetadata[0];
-    const dims = meta && (meta.shape || meta.dims);
-    if (dims && typeof dims[2] === 'number' && dims[2] > 0) inputSize = dims[2];
-
-    // 워밍업 겸 출력 형식 확인
-    const zeros = new ort.Tensor('float32', new Float32Array(3 * inputSize * inputSize), [1, 3, inputSize, inputSize]);
-    const t0 = performance.now();
-    const out = await session.run({ [inputName]: zeros });
-    const od = out[outputName].dims;
-    const nmsInModel = od.length === 3 && od[2] === 6;
-    labels.nms_in_model = nmsInModel;
-
-    ui.engine.textContent = `${engineName.toUpperCase()} · ${inputSize}px · NMS ${nmsInModel ? '내장' : 'JS'}` +
-      (usingFallbackModel ? ' · 시험용 모델' : '');
-    log(`✓ 모델 로드 완료 (${engineName}, 입력 ${inputSize}px, 출력 [${od.join(',')}], 워밍업 ${Math.round(performance.now() - t0)}ms)`);
+    ui.engine.textContent = engineLabel();
     log(`클래스: ${labels.names.join(', ') || '(labels.json 없음)'}`);
     setStatus(usingFallbackModel ? '시험용 모델 준비 완료' : '모델 준비 완료');
+    setModelButton('ready');
+    loopState.recoveries = 0;
+    return true;
   } catch (e) {
     log(`✗ 모델 로드 실패: ${e.message}`);
     console.error('모델 로드 오류:', e);
-    setStatus('모델 로드 실패');
+    setStatus('모델 로드 실패 — 🔄 모델 로드 버튼을 눌러 다시 시도');
     session = null;
+    setModelButton('retry');
+    return false;
+  } finally {
+    modelLoading = false;
+  }
+}
+
+let modelLoading = false;
+let activeModelUrl = null;
+
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} 시간 초과 (${ms}ms)`)), ms);
+    promise.then(
+      (v) => { clearTimeout(t); resolve(v); },
+      (e) => { clearTimeout(t); reject(e); }
+    );
+  });
+}
+
+function engineLabel() {
+  return `${engineName.toUpperCase()} · ${inputSize}px · NMS ${labels.nms_in_model ? '내장' : 'JS'}` +
+    (usingFallbackModel ? ' · 시험용 모델' : '');
+}
+
+function setModelButton(state) {
+  const b = ui.btnLoadModel;
+  if (!b) return;
+  if (state === 'loading') {
+    b.disabled = true;
+    b.textContent = '⏳ 모델 로드 중...';
+  } else if (state === 'ready') {
+    b.disabled = false;
+    b.textContent = '🔄 모델 다시 로드';
+    b.classList.add('secondary');
+  } else {
+    b.disabled = false;
+    b.textContent = '🔄 모델 로드';
+    b.classList.remove('secondary'); // 실패 시 눈에 띄게
+  }
+}
+
+// 세션 생성 + 워밍업. providers 를 순서대로 시도해 처음 성공한 것을 쓴다
+async function createSession(modelUrl, providers) {
+  let lastErr = null;
+  for (const ep of providers) {
+    try {
+      const s = await withTimeout(
+        ort.InferenceSession.create(modelUrl, { executionProviders: [ep], graphOptimizationLevel: 'all' }),
+        CONFIG.loadTimeoutMs, `${ep} 세션 생성`
+      );
+      const inName = s.inputNames[0];
+      const outName = s.outputNames[0];
+      // 입력 크기: 모델 메타데이터 → labels.json → 640 순서로 결정
+      let size = labels.imgsz || 640;
+      const meta = s.inputMetadata && s.inputMetadata[0];
+      const dims = meta && (meta.shape || meta.dims);
+      if (dims && typeof dims[2] === 'number' && dims[2] > 0) size = dims[2];
+      // 워밍업 겸 출력 형식 확인
+      const zeros = new ort.Tensor('float32', new Float32Array(3 * size * size), [1, 3, size, size]);
+      const t0 = performance.now();
+      const out = await withTimeout(s.run({ [inName]: zeros }), CONFIG.loadTimeoutMs, `${ep} 워밍업`);
+      const od = out[outName].dims;
+      session = s;
+      engineName = ep;
+      inputName = inName;
+      outputName = outName;
+      inputSize = size;
+      labels.nms_in_model = od.length === 3 && od[2] === 6;
+      log(`✓ 모델 로드 완료 (${ep}, 입력 ${size}px, 출력 [${od.join(',')}], 워밍업 ${Math.round(performance.now() - t0)}ms)`);
+      return true;
+    } catch (e) {
+      lastErr = e;
+      log(`${ep} 초기화 실패 → 다음 백엔드 시도 (${String((e && e.message) || e).split('\n')[0]})`);
+    }
+  }
+  throw lastErr || new Error('세션 생성 실패');
+}
+
+// 추론이 멈추거나 오류가 반복되면 세션을 새로 만든다 (WebGPU 가 문제면 WASM 으로 내려감)
+async function recoverSession(reason) {
+  loopState.recoveries += 1;
+  if (loopState.recoveries > CONFIG.maxRecoveries) {
+    log(`✗ 복구 한도(${CONFIG.maxRecoveries}회) 초과`);
+    return false;
+  }
+  log(`⚠ ${reason} → 모델을 WASM 으로 다시 불러옵니다 (복구 ${loopState.recoveries}/${CONFIG.maxRecoveries})`);
+  const old = session;
+  session = null;
+  try { if (old) await old.release(); } catch (_) { /* 무시 */ }
+  try {
+    await createSession(activeModelUrl || CONFIG.modelUrl, ['wasm']);
+    ui.engine.textContent = engineLabel() + ' · 복구됨';
+    return true;
+  } catch (e) {
+    log(`✗ 복구 실패: ${e.message}`);
+    return false;
   }
 }
 
@@ -379,6 +470,8 @@ const settings = {
   flash: true, // 위험 알림 중 화면 깜빡임
   flashLevel: 'light', // light | mid | strong
   onboarded: false, // 첫 접속 안내를 봤는지
+  aiVoice: false, // AI 음성 안내 (이어폰 전용, 기본 꺼짐)
+  aiKey: '', // Claude API 키 (선택). 없으면 규칙 문장만 사용
 };
 
 function loadSettings() {
@@ -559,25 +652,41 @@ setInterval(refreshIndicator, 1000);
 // ============================================
 const perf = { ms: 0, frames: 0, lastReport: 0 };
 
+// 감지 루프 상태 (멈춤·오류 복구용)
+const loopState = { token: 0, inFlight: false, frameStart: 0, lastTick: 0, consecutiveErrors: 0, recoveries: 0, lastVideoTime: -1, lastVideoChange: 0 };
+
 async function inferenceLoop() {
-  if (!session || !(webcamStream || testImage)) {
-    log('✗ 모델 또는 카메라가 준비되지 않았습니다.');
+  if (!session) {
+    log('✗ 모델이 준비되지 않았습니다. 🔄 모델 로드 버튼을 눌러 주세요.');
+    setStatus('모델 없음 — 🔄 모델 로드 필요');
+    setModelButton('retry');
+    return;
+  }
+  if (!(webcamStream || testImage)) {
+    log('✗ 카메라가 준비되지 않았습니다. 📷 카메라 시작을 눌러 주세요.');
     return;
   }
   if (isRunning) return;
   isRunning = true;
+  loopState.token += 1;
+  const myToken = loopState.token;
+  loopState.consecutiveErrors = 0;
+  loopState.lastTick = performance.now();
   setStatus('감지 중...');
   log('감지 시작됨');
   const ctx = ui.overlay.getContext('2d');
 
   const step = async () => {
-    if (!isRunning) return;
+    if (!isRunning || myToken !== loopState.token) return;
     const t0 = performance.now();
+    loopState.inFlight = true;
+    loopState.frameStart = t0;
+    loopState.lastTick = t0;
     try {
       const src = frameSource();
       const vw = src.w;
       const vh = src.h;
-      if (vw && vh) {
+      if (vw && vh && session) {
         if (ui.overlay.width !== vw) {
           ui.overlay.width = vw;
           ui.overlay.height = vh;
@@ -587,7 +696,8 @@ async function inferenceLoop() {
         const minProximity = parseFloat(ui.proximity.value) || 0.2;
 
         const lb = preprocess(src, inputSize);
-        const result = await session.run({ [inputName]: lb.tensor });
+        const result = await withTimeout(session.run({ [inputName]: lb.tensor }), CONFIG.frameTimeoutMs, '추론');
+        if (!isRunning || myToken !== loopState.token) return;
         const dets = postprocess(result[outputName], lb, conf, vw, vh);
         const best = assess(dets, vw, vh, minProximity);
         const confirmed = updateHysteresis(best ? best.label : null, requiredFrames);
@@ -596,16 +706,36 @@ async function inferenceLoop() {
         updateDetectionList(dets, best);
         updateFloatingIndicator(!!confirmed);
 
-        if (confirmed && best) vibrateFor(best);
-        else stopVibration();
+        if (confirmed && best) {
+          vibrateFor(best);
+          announceDanger(best, dets);
+        } else {
+          stopVibration();
+        }
         health.lastFrameTs = performance.now();
+        loopState.consecutiveErrors = 0;
       }
     } catch (e) {
+      loopState.consecutiveErrors += 1;
+      const msg = String((e && e.message) || e).split('\n')[0];
       console.error('추론 오류:', e);
-      log(`감지 오류: ${e.message}`);
-      stopLoop();
-      return;
+      log(`감지 오류 ${loopState.consecutiveErrors}회: ${msg}`);
+      const timedOut = /시간 초과/.test(msg);
+      if (timedOut || loopState.consecutiveErrors >= CONFIG.maxConsecutiveErrors) {
+        const ok = await recoverSession(timedOut ? '추론이 응답하지 않음' : '오류 반복');
+        if (!ok) {
+          loopState.inFlight = false;
+          stopLoop();
+          setStatus('감지 중단 — 🔄 모델 로드 후 ▶️ 감지 시작을 눌러 주세요');
+          setModelButton('retry');
+          return;
+        }
+        loopState.consecutiveErrors = 0;
+      }
+    } finally {
+      loopState.inFlight = false;
     }
+    if (!isRunning || myToken !== loopState.token) return;
     // 성능 표시
     perf.ms = perf.ms * 0.8 + (performance.now() - t0) * 0.2;
     perf.frames += 1;
@@ -613,20 +743,82 @@ async function inferenceLoop() {
       perf.lastReport = performance.now();
       setStatus(`감지 중 · ${Math.round(perf.ms)}ms/프레임 (${(1000 / Math.max(1, perf.ms)).toFixed(1)} FPS)`);
     }
-    animationHandle = requestAnimationFrame(step);
+    scheduleNext(step);
   };
   step();
 }
 
+// 다음 프레임 예약: requestAnimationFrame 이 오지 않는 환경(일부 모바일 브라우저, 백그라운드)에서는 타이머로 진행
+function scheduleNext(step) {
+  let fired = false;
+  const go = () => {
+    if (fired) return;
+    fired = true;
+    step();
+  };
+  animationHandle = requestAnimationFrame(go);
+  setTimeout(go, document.hidden ? 1000 : 300);
+}
+
 function stopLoop() {
   isRunning = false;
+  loopState.token += 1;
   stopVibration();
   updateFloatingIndicator(false);
   setStatus('정지됨');
   if (animationHandle) cancelAnimationFrame(animationHandle);
 }
 
+function reopenCamera(why) {
+  log(`⚠ ${why} → 카메라를 다시 엽니다`);
+  try { if (webcamStream) webcamStream.getTracks().forEach((t) => t.stop()); } catch (_) { /* 무시 */ }
+  webcamStream = null;
+  ui.video.srcObject = null;
+  openCamera();
+}
+
+// 감시: 루프가 멈추거나 카메라 영상이 얼면 스스로 복구
+setInterval(() => {
+  if (!isRunning) return;
+  const now = performance.now();
+  // 1) 추론 Promise 가 끝내 돌아오지 않음 (withTimeout 도 못 잡는 극단 상황)
+  if (loopState.inFlight && now - loopState.frameStart > CONFIG.frameTimeoutMs + 15000) {
+    log('⚠ 감지 루프가 응답하지 않아 다시 시작합니다');
+    isRunning = false;
+    loopState.token += 1;
+    loopState.inFlight = false;
+    inferenceLoop();
+    return;
+  }
+  // 2) 다음 프레임이 예약되지 않은 채 멈춤
+  if (!loopState.inFlight && now - loopState.lastTick > 6000 && !document.hidden) {
+    log('⚠ 감지가 멈춘 것을 감지해 다시 시작합니다');
+    isRunning = false;
+    loopState.token += 1;
+    inferenceLoop();
+    return;
+  }
+  // 3) 카메라 스트림이 끊기거나 영상이 얼어 있음
+  if (webcamStream && !testImage) {
+    const v = ui.video;
+    const track = webcamStream.getVideoTracks()[0];
+    if (track && track.readyState === 'ended') {
+      reopenCamera('카메라 스트림이 끊김');
+      return;
+    }
+    if (v.paused && v.readyState >= 2) v.play().catch(() => {});
+    if (v.currentTime !== loopState.lastVideoTime) {
+      loopState.lastVideoTime = v.currentTime;
+      loopState.lastVideoChange = now;
+    } else if (loopState.lastVideoChange && now - loopState.lastVideoChange > 5000 && !document.hidden) {
+      loopState.lastVideoChange = now;
+      reopenCamera('카메라 영상이 5초 이상 멈춤');
+    }
+  }
+}, 2000);
+
 ui.btnCamera.addEventListener('click', openCamera);
+ui.btnLoadModel.addEventListener('click', () => loadModel({ force: !!session }));
 ui.btnStart.addEventListener('click', inferenceLoop);
 ui.btnStop.addEventListener('click', stopLoop);
 
@@ -692,6 +884,9 @@ function syncSettingsUI() {
   document.querySelectorAll('input[name="flashLevel"]').forEach((r) => (r.checked = r.value === settings.flashLevel));
   document.getElementById('flashToggle').checked = settings.flash;
   document.getElementById('startFlashToggle').checked = settings.flash;
+  document.getElementById('aiVoiceToggle').checked = settings.aiVoice;
+  document.getElementById('aiKeyInput').value = settings.aiKey || '';
+  updateAiVoiceStatus();
 }
 
 function bindSettingsUI() {
@@ -715,6 +910,36 @@ function bindSettingsUI() {
     settings.flash = e.target.checked;
     saveSettings();
     if (!settings.flash) setFlash(false);
+  });
+  document.getElementById('aiVoiceToggle').addEventListener('change', (e) => {
+    settings.aiVoice = e.target.checked;
+    saveSettings();
+    if (settings.aiVoice) checkEarphones().then(() => updateAiVoiceStatus());
+    else if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+  });
+  document.getElementById('aiKeyInput').addEventListener('change', (e) => {
+    settings.aiKey = e.target.value.trim();
+    saveSettings();
+    updateAiVoiceStatus();
+  });
+  document.getElementById('btnAiVoiceTest').addEventListener('click', async () => {
+    const sample = { label: 'stairs', ko: '계단', dir: 'center', near: true, score: 0.8, risk: 1, prox: 0.6 };
+    const text = dangerSentence(sample, [sample]);
+    speakAlert(text);
+    updateAiVoiceStatus(`규칙 문장: ${text}`);
+    if ((settings.aiKey || '').trim()) {
+      try {
+        const t = await requestAiSentence(buildAiContext(sample, [sample]));
+        if (t) {
+          speakAlert(t);
+          updateAiVoiceStatus(`AI 문장: ${t}`);
+        } else {
+          updateAiVoiceStatus('AI 가 문장을 만들지 않았습니다');
+        }
+      } catch (e) {
+        updateAiVoiceStatus(`AI 호출 실패: ${e.name === 'AbortError' ? '시간 초과' : e.message}`);
+      }
+    }
   });
   document.getElementById('btnVibTest').addEventListener('click', () => {
     if (!testVibration()) log('진동을 지원하지 않거나 차단된 기기입니다.');
@@ -754,11 +979,17 @@ async function startApp() {
   } else if (!webcamStream) {
     await openCamera();
   }
+  if (settings.aiVoice) checkEarphones().then(() => updateAiVoiceStatus());
+  // 모델이 아직 없으면(로드 실패·지연) 한 번 더 시도
+  if (!session && !modelLoading) await loadModel();
   if (session && (webcamStream || testImage)) {
     log('🚀 감지를 시작합니다...');
     inferenceLoop();
+  } else if (!session) {
+    log('✗ 모델이 없어 시작하지 못했습니다. 🔄 모델 로드 버튼을 눌러 주세요.');
+    setModelButton('retry');
   } else {
-    log('✗ 시작 실패: 모델 또는 카메라가 준비되지 않았습니다.');
+    log('✗ 카메라가 준비되지 않았습니다. 📷 카메라 시작을 눌러 주세요.');
   }
 }
 
@@ -778,3 +1009,173 @@ window.addEventListener('load', async () => {
   showStartOverlay();
   await loadModel();
 });
+
+
+// ============================================
+// AI 음성 안내 (이어폰 전용): 위험 상황을 설명하는 문장을 만들어 TTS 로 읽어 준다
+// - 첫 안내는 지연 없는 규칙 문장, 생성형 AI(Claude) 문장은 받아 두었다가 반복 안내부터 사용
+// - API 키가 없으면 규칙 문장만 사용
+// ============================================
+const AI_VOICE = {
+  model: 'claude-opus-5-5',
+  endpoint: 'https://api.anthropic.com/v1/messages',
+  timeoutMs: 6000,
+  cacheMs: 60000, // 같은 상황의 AI 문장 재사용 시간
+  repeatMs: 8000, // 같은 위험이 계속되면 이 간격으로 다시 읽음
+};
+const aiVoice = { lastKey: null, lastT: 0, cache: new Map(), pending: new Set(), earphone: { known: false, connected: false }, warned: false };
+
+// 받침 유무에 따른 조사
+function josa(word, withFinal, withoutFinal) {
+  const ch = word.charCodeAt(word.length - 1);
+  if (ch < 0xac00 || ch > 0xd7a3) return withoutFinal;
+  return (ch - 0xac00) % 28 === 0 ? withoutFinal : withFinal;
+}
+
+const ADVICE = {
+  crosswalk: '멈춰서 신호와 차량을 확인하세요.',
+  stairs: '발밑을 보고 천천히 가세요.',
+  pole: '부딪히지 않게 옆으로 피하세요.',
+  person: '사람과 부딪히지 않게 주의하세요.',
+  vehicle: '차량이 가까이 있습니다. 멈추세요.',
+};
+
+// 규칙 기반 문장 (API 키 없이도 동작, 지연 없음)
+function dangerSentence(best, dets) {
+  const dir = DIR_KO[best.dir] || '앞';
+  const where = best.near ? '바로 앞' : '앞쪽';
+  const others = dets
+    .filter((d) => d !== best && d.label !== best.label && (d.risk || 0) > 0.2)
+    .slice(0, 2)
+    .map((d) => d.ko);
+  let s = `${dir} ${where}에 ${best.ko}${josa(best.ko, '이', '가')} 있습니다. ${ADVICE[best.label] || '전방을 확인하세요.'}`;
+  if (others.length) s += ` 주변에 ${others.join('과 ')}도 있습니다.`;
+  return s;
+}
+
+function speakAlert(text) {
+  if (!('speechSynthesis' in window)) return false;
+  try {
+    window.speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'ko-KR';
+    u.rate = 1.05;
+    window.speechSynthesis.speak(u);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// 이어폰 연결 확인: 출력 장치 목록을 주는 기기에서만 판단 가능 (known=false 면 알 수 없음)
+async function checkEarphones() {
+  const result = { known: false, connected: false };
+  try {
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const outs = devs.filter((d) => d.kind === 'audiooutput' && d.label);
+      if (outs.length) {
+        result.known = true;
+        result.connected = outs.some((d) => /head|ear|bud|pod|이어|헤드|bluetooth|블루투스/i.test(d.label));
+      }
+    }
+  } catch (_) {
+    /* 무시 */
+  }
+  aiVoice.earphone = result;
+  return result;
+}
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', () => checkEarphones().then(() => updateAiVoiceStatus()));
+}
+
+function buildAiContext(best, dets) {
+  return {
+    main: { object: best.ko, direction: DIR_KO[best.dir], proximity: best.near ? '가까움' : '접근 중', confidence: Math.round((best.score || 0) * 100) },
+    others: dets.filter((d) => d !== best).slice(0, 3).map((d) => ({ object: d.ko, direction: DIR_KO[d.dir], proximity_percent: Math.round((d.prox || 0) * 100) })),
+    user: '보행 중 스마트폰을 보는 사용자 또는 시각장애인',
+  };
+}
+
+// Claude API 로 한 문장 생성 (브라우저에서 직접 호출)
+async function requestAiSentence(ctx) {
+  const key = (settings.aiKey || '').trim();
+  if (!key) return null;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), AI_VOICE.timeoutMs);
+  try {
+    const res = await fetch(AI_VOICE.endpoint, {
+      method: 'POST',
+      signal: ctl.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': 'server-side-fallback-2026-07-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: AI_VOICE.model,
+        max_tokens: 1024,
+        output_config: { effort: 'low' },
+        fallbacks: 'default',
+        system:
+          '너는 보행 중 스마트폰을 보는 사람과 시각장애인을 돕는 안전 안내 음성이다. ' +
+          '카메라가 감지한 위험 정보를 JSON 으로 받으면, 한국어 존댓말로 두 문장 이내(50자 이내)로 위험의 종류·방향·거리를 알리고 바로 할 행동을 지시한다. ' +
+          '숫자·기호·괄호·영어 없이 말하듯이 쓴다. 문장만 출력한다.',
+        messages: [{ role: 'user', content: JSON.stringify(ctx) }],
+      }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.stop_reason === 'refusal') return null;
+    const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join(' ').trim();
+    return text || null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function announceDanger(best, dets) {
+  if (!settings.aiVoice || !best) return;
+  const key = `${best.label}|${best.dir}|${best.near}`;
+  const now = performance.now();
+  if (key === aiVoice.lastKey && now - aiVoice.lastT < AI_VOICE.repeatMs) return;
+  aiVoice.lastKey = key;
+  aiVoice.lastT = now;
+  if (aiVoice.earphone.known && !aiVoice.earphone.connected) {
+    if (!aiVoice.warned) {
+      aiVoice.warned = true;
+      log('🔇 이어폰이 감지되지 않아 AI 음성 안내를 하지 않습니다');
+    }
+    return;
+  }
+  const cached = aiVoice.cache.get(key);
+  const text = cached && now - cached.t < AI_VOICE.cacheMs ? cached.text : dangerSentence(best, dets);
+  speakAlert(text);
+  log(`🔊 ${text}`);
+  if ((settings.aiKey || '').trim() && !cached && !aiVoice.pending.has(key)) {
+    aiVoice.pending.add(key);
+    requestAiSentence(buildAiContext(best, dets))
+      .then((t) => {
+        if (t) {
+          aiVoice.cache.set(key, { text: t, t: performance.now() });
+          log(`🤖 AI 문장 준비: ${t}`);
+        }
+      })
+      .catch((e) => log(`AI 문장 생성 실패: ${e.name === 'AbortError' ? '시간 초과' : e.message}`))
+      .finally(() => aiVoice.pending.delete(key));
+  }
+}
+
+function updateAiVoiceStatus(extra) {
+  const el = document.getElementById('aiVoiceStatus');
+  if (!el) return;
+  const e = aiVoice.earphone;
+  const ear = !e.known
+    ? '이어폰 연결 여부를 이 기기에서는 확인할 수 없습니다. 이어폰을 꽂은 뒤에만 켜 주세요.'
+    : e.connected ? '이어폰 연결됨 ✓' : '이어폰이 감지되지 않아 안내가 울리지 않습니다.';
+  const tts = 'speechSynthesis' in window ? '' : ' 이 브라우저는 음성 합성을 지원하지 않습니다.';
+  const ai = (settings.aiKey || '').trim() ? 'Claude API 로 문장 생성' : '규칙 문장 사용 (API 키 없음)';
+  el.textContent = `${ear}${tts} · ${ai}${extra ? ' · ' + extra : ''}`;
+}

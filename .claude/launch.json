@@ -4,8 +4,30 @@
     {
       "name": "static",
       "runtimeExecutable": "py",
-      "runtimeArgs": ["-3", "-m", "http.server", "8000", "--bind", "127.0.0.1"],
+      "runtimeArgs": [
+        "-3",
+        "-m",
+        "http.server",
+        "8000",
+        "--bind",
+        "127.0.0.1"
+      ],
       "port": 8000
+    },
+    {
+      "name": "gps",
+      "runtimeExecutable": "py",
+      "runtimeArgs": [
+        "-3",
+        "-m",
+        "http.server",
+        "8001",
+        "--bind",
+        "127.0.0.1",
+        "--directory",
+        "../minjae-gps"
+      ],
+      "port": 8001
     }
   ]
 }
