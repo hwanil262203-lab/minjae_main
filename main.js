@@ -729,18 +729,7 @@ function bindSettingsUI() {
   });
 
   // 시작 안내 창
-  const vibResult = document.getElementById('vibTestResult');
-  if (!canVibrate) {
-    document.getElementById('noVibrateNote').hidden = false;
-    document.getElementById('btnVibTestStart').disabled = true;
-    vibResult.textContent = '이 기기는 진동 미지원';
-  }
-  document.getElementById('btnVibTestStart').addEventListener('click', () => {
-    const ok = testVibration();
-    vibResult.textContent = ok
-      ? '진동이 느껴지지 않으면 무음 모드를 진동 모드로 바꿔 주세요'
-      : '진동이 차단되어 있습니다. 화면 깜빡임을 켜 두세요';
-  });
+  if (!canVibrate) document.getElementById('noVibrateNote').hidden = false;
   document.getElementById('btnStartApp').addEventListener('click', startApp);
 }
 
