@@ -572,14 +572,12 @@ function muteCurrent(label) {
   mute.lastSeen = performance.now();
   stopVibration();
   log(`🔇 ${classInfo(label).ko} 진동 끔 — 화면에서 사라졌다가 다시 나타나면 다시 울립니다`);
-  refreshIndicator();
 }
 
 function clearMute(why) {
   if (!mute.label) return;
   log(`🔔 ${classInfo(mute.label).ko} 진동 다시 켬 (${why})`);
   mute.label = null;
-  refreshIndicator();
 }
 
 function vibrateFor(det) {
@@ -689,7 +687,6 @@ const INDICATOR = {
   ok: { cls: '', text: '✓', title: '정상 작동 중 (드래그하여 이동 가능)' },
   warn: { cls: 'warn', text: '!', title: '비정상: 감지가 동작하지 않습니다 (드래그하여 이동 가능)' },
   danger: { cls: 'danger', text: '!', title: '위험 감지됨! 누르면 이 대상이 사라질 때까지 진동을 끕니다 (드래그하여 이동 가능)' },
-  muted: { cls: 'danger muted', text: '🔇', title: '진동 꺼짐: 이 대상이 화면에서 사라졌다가 다시 나타나면 다시 울립니다' },
 };
 let indicatorState = null;
 
@@ -697,8 +694,8 @@ function setIndicator(state) {
   if (state === indicatorState) return;
   indicatorState = state;
   const s = INDICATOR[state] || INDICATOR.warn;
-  ui.floatingIndicator.classList.remove('warn', 'danger', 'muted');
-  if (s.cls) ui.floatingIndicator.classList.add(...s.cls.split(' '));
+  ui.floatingIndicator.classList.remove('warn', 'danger');
+  if (s.cls) ui.floatingIndicator.classList.add(s.cls);
   ui.floatingIndicator.textContent = s.text;
   ui.floatingIndicator.title = s.title;
 }
@@ -712,7 +709,7 @@ function updateFloatingIndicator(isDanger) {
 }
 
 function refreshIndicator() {
-  if (health.danger) return setIndicator(mute.label ? 'muted' : 'danger');
+  if (health.danger) return setIndicator('danger');
   const alive = isRunning && session && performance.now() - health.lastFrameTs < 4000;
   setIndicator(alive ? 'ok' : 'warn');
 }
@@ -957,8 +954,8 @@ function endDrag() {
 function onIndicatorTap() {
   const label = hysteresisState.lastLabel;
   if (!health.danger || !label) return; // 위험 상태가 아닐 때는 아무 일도 없음
-  if (mute.label === label) clearMute('다시 눌러서 해제');
-  else muteCurrent(label);
+  if (mute.label === label) return; // 이미 무음이면 그대로 (수동 해제 없음, 대상이 사라져야 풀림)
+  muteCurrent(label);
 }
 
 ui.floatingIndicator.addEventListener('mousedown', (e) => {
