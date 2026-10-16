@@ -53,7 +53,6 @@ const DIR_KO = { left: '왼쪽', center: '정면', right: '오른쪽' };
 const ui = {
   video: document.getElementById('video'),
   overlay: document.getElementById('overlay'),
-  btnCamera: document.getElementById('btnCamera'),
   btnLoadModel: document.getElementById('btnLoadModel'),
   btnStart: document.getElementById('btnStart'),
   btnStop: document.getElementById('btnStop'),
@@ -732,7 +731,7 @@ async function inferenceLoop() {
     return;
   }
   if (!(webcamStream || testImage)) {
-    log('✗ 카메라가 준비되지 않았습니다. 📷 카메라 시작을 눌러 주세요.');
+    log('✗ 카메라가 준비되지 않았습니다. 카메라 권한을 확인한 뒤 페이지를 새로고침해 주세요.');
     return;
   }
   if (isRunning) return;
@@ -905,7 +904,6 @@ setInterval(() => {
   }
 }, 2000);
 
-ui.btnCamera.addEventListener('click', openCamera);
 ui.btnLoadModel.addEventListener('click', () => (session ? loadModel({ force: true }) : ensureModel()));
 document.getElementById('btnErrorReload').addEventListener('click', () => location.reload());
 ui.btnStart.addEventListener('click', inferenceLoop);
@@ -1018,15 +1016,6 @@ function bindSettingsUI() {
     saveSettings();
     log(`GPU 가속 ${settings.useWebGpu ? '사용' : '사용 안 함'} — 🔄 모델 다시 로드 를 누르면 적용됩니다`);
   });
-  document.getElementById('btnCopyLog').addEventListener('click', async () => {
-    const text = [navigator.userAgent, ui.engine.textContent, ui.status.textContent, '', ui.log.textContent].join('\n');
-    try {
-      await navigator.clipboard.writeText(text);
-      log('📋 로그를 복사했습니다. 메시지로 붙여 넣어 보내 주세요.');
-    } catch (_) {
-      window.prompt('아래 내용을 길게 눌러 복사하세요', text);
-    }
-  });
   document.getElementById('btnVibTest').addEventListener('click', () => {
     if (!testVibration()) log('진동을 지원하지 않거나 차단된 기기입니다.');
   });
@@ -1074,7 +1063,7 @@ async function startApp() {
     log('✗ 모델이 없어 시작하지 못했습니다. 🔄 모델 로드 버튼을 눌러 주세요.');
     setModelButton('retry');
   } else {
-    log('✗ 카메라가 준비되지 않았습니다. 📷 카메라 시작을 눌러 주세요.');
+    log('✗ 카메라가 준비되지 않았습니다. 카메라 권한을 확인한 뒤 페이지를 새로고침해 주세요.');
   }
 }
 

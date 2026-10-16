@@ -448,7 +448,6 @@
 
     <header>
       <h1>위험지대 감지 + 진동 알림 <span style="font-size: 12px; color: #4ade80; font-weight: normal;">🤖 YOLO 객체 감지</span></h1>
-      <button id="btnSettings" class="secondary" title="설정">⚙ 설정</button>
     </header>
     <main>
       <div class="content">
@@ -457,9 +456,8 @@
           <canvas id="overlay"></canvas>
         </section>
         <aside class="sidebar">
-          <div class="hint">💡 오른쪽 위 동그라미: 초록 ✓ 정상 작동 · 노랑 ! 감지 중단 · 빨강 ! 위험. 빨강일 때 누르면 그 대상이 사라질 때까지 진동을 끕니다 (잘못 감지했을 때)</div>
           <div class="row">
-            <button id="btnCamera">📷 카메라 시작</button>
+            <button id="btnSettings" title="설정">⚙ 설정</button>
             <button id="btnLoadModel" class="secondary">🔄 모델 로드</button>
           </div>
           <div class="row">
@@ -469,7 +467,6 @@
           <div class="row">
             <div class="badge" id="status">초기화 중...</div>
             <div class="badge" id="engine">엔진: -</div>
-            <button id="btnCopyLog" class="secondary" style="padding: 4px 8px; font-size: 12px;">📋 로그 복사</button>
           </div>
           <div class="log" id="log"></div>
         </aside>
