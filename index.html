@@ -424,6 +424,20 @@
           <button id="btnFlashTest" class="secondary">✨ 깜빡임 테스트 (2초)</button>
         </div>
 
+        <h3>거리 보정</h3>
+        <p style="font-size: 12px; color: #6b7a99;">거리는 카메라 한 개의 비례식(박스 아랫변 위치 + 카메라 높이 + 폰 기울기)으로 계산합니다. 폰마다 다른 초점거리는 웹에서 읽을 수 없어 기본값을 쓰며, 줄자로 잰 지점을 한 번 눌러 주면 이 기기에 맞게 보정됩니다.</p>
+        <div class="row">
+          <label>카메라 높이 (cm)</label>
+          <input id="camHeight" type="number" min="50" max="250" step="5" value="130" />
+        </div>
+        <div class="row">
+          <label>보정 거리 (cm)</label>
+          <input id="calibDist" type="number" min="50" max="500" step="10" value="100" />
+          <button id="btnCalib" class="secondary">📏 보정 시작</button>
+          <button id="btnCalibReset" class="secondary">기본값</button>
+        </div>
+        <div id="rangeInfo" class="muted" style="font-size: 12px"></div>
+
         <h3>고급 (감지 민감도)</h3>
         <label class="toggle">
           <span>GPU 가속(WebGPU) 사용 — 이 기기에서 실패하면 자동으로 꺼짐</span>
@@ -434,8 +448,8 @@
           <input id="threshold" type="number" min="0" max="1" step="0.05" value="0.25" />
         </div>
         <div class="row">
-          <label>근접 임계치</label>
-          <input id="proximity" type="number" min="0" max="1" step="0.05" value="0.20" title="근접도(0~1): 박스 아랫변이 화면 아래쪽일수록·박스가 클수록 큼. 이 값 이상이어야 위험으로 판단" />
+          <label>알림 거리 (m)</label>
+          <input id="proximity" type="number" min="1" max="10" step="0.5" value="5" title="추정 거리가 이 값 안일 때만 위험으로 판단" />
         </div>
         <div class="row">
           <label>확정 프레임</label>

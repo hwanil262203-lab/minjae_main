@@ -2,7 +2,7 @@
   YOLO 객체 감지 (ONNX Runtime Web) + 스마트폰 진동
   - best.onnx (Ultralytics YOLO export, opset 12) 를 브라우저에서 실행
   - WebGPU 우선, 실패 시 WASM(CPU) 폴백
-  - 박스 위치로 방향(좌/중/우), 박스 아랫변 위치(+높이 보조)로 근접도 계산
+  - 박스 아랫변 위치 + 카메라 높이 + 폰 기울기로 거리(m) 추정 (사람·차량은 크기도 함께), 방향은 박스 위치
   - 신뢰도 임계치 + 연속 프레임 히스테리시스 후 방향/근접도별 진동 패턴
 */
 
@@ -467,21 +467,91 @@ function postprocess(output, lb, conf, vw, vh) {
 }
 
 // ============================================
-// 위험 판단: 방향 + 근접도 + 클래스 가중치
+// 거리 추정(미터) — 김민재 진로세특 '카메라 한 개로 거리 측정' 원리(닮은 삼각형 비례식) 적용
+//  · 바닥 기준: 카메라 높이 h 와 폰 기울기를 알면, 박스 아랫변 픽셀 y 를 내려다본 각 α = (아래로 기운 각) + atan((y − cy) ÷ f),
+//    거리 d = h ÷ tan α.  보고서의 '물체의 실제 크기' 자리에 카메라 높이를 넣은 것이라 종류와 상관없이 쓸 수 있다.
+//  · 크기 기준: 실제 높이를 아는 종류(사람·차량)는 보고서 공식 그대로 d = f × 실제 높이 ÷ 박스 픽셀 높이.
+//  · 초점거리 f(픽셀)는 웹 브라우저가 알려 주지 않는다 → 화각 66° 가정값(긴 변 × 0.77)을 쓰고 설정의 '1m 보정'으로 기기별로 맞춘다.
+//  · 기울기는 DeviceOrientation(beta) 로 읽는다. 없으면 가슴 높이에서 조금 숙인 −12° 로 가정.
+// ============================================
+const REAL_HEIGHT = { person: 1.6, vehicle: 1.5, car: 1.5, bus: 3.0, truck: 2.5, bicycle: 1.0, motorcycle: 1.1 };
+const Range = {
+  pitchDeg: null, // 카메라 광축이 수평에서 기운 각 (아래로 향하면 음수)
+  src: 'none', // 'sensor' | 'none'
+  DEFAULT_PITCH: -12,
+  calibrating: false,
+  focal(vw, vh) { return settings.focalScale * Math.max(vw, vh); },
+  pitch() { return this.pitchDeg == null ? this.DEFAULT_PITCH : this.pitchDeg; },
+  downRad() { return (-this.pitch() * Math.PI) / 180; },
+  // 박스 아랫변 y(픽셀) → 바닥 위 그 지점까지의 거리(m). 지평선 위면 null
+  groundDist(y2, vw, vh) {
+    const alpha = this.downRad() + Math.atan((y2 - vh / 2) / this.focal(vw, vh));
+    if (alpha < 0.015) return null; // 거의 수평 → 너무 멀거나 지평선 위
+    return settings.camHeight / Math.tan(alpha);
+  },
+  sizeDist(label, hPx, vw, vh) {
+    const H = REAL_HEIGHT[label];
+    if (!H || hPx < 4) return null;
+    return (this.focal(vw, vh) * H) / hPx;
+  },
+  estimate(det, vw, vh) {
+    const g = this.groundDist(det.y2, vw, vh);
+    const s = this.sizeDist(det.label, det.y2 - det.y1, vw, vh);
+    let d = null, src = '';
+    if (g != null && s != null) { d = Math.sqrt(g * s); src = '바닥+크기'; } // 기하 평균
+    else if (g != null) { d = g; src = '바닥'; }
+    else if (s != null) { d = s; src = '크기'; }
+    if (d != null) d = Math.max(0.3, Math.min(50, d));
+    return { d, src };
+  },
+  // 폰 기울기: 세로로 들었을 때 beta=90° 가 카메라 수평. 숙이면 작아진다
+  onOrient(e) {
+    if (typeof e.beta !== 'number') return;
+    if (Math.abs(e.gamma || 0) > 60) return; // 옆으로 눕힌 상태는 무시
+    const p = e.beta - 90;
+    Range.pitchDeg = Range.pitchDeg == null ? p : Range.pitchDeg * 0.7 + p * 0.3; // 떨림 완화
+    Range.src = 'sensor';
+  },
+  async start() {
+    try {
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        const r = await DeviceOrientationEvent.requestPermission(); // iOS: 사용자 탭 안에서만
+        if (r !== 'granted') return false;
+      }
+    } catch (_) { return false; }
+    window.addEventListener('deviceorientation', this.onOrient, true);
+    return true;
+  },
+  // 1m 보정: 사용자가 D m 앞 바닥 지점을 화면에서 누르면 f 를 역산
+  calibrateFromTap(yTap, vw, vh, D) {
+    const alpha = Math.atan(settings.camHeight / D); // 그 지점을 내려다본 각
+    const rel = alpha - this.downRad(); // 화면 가운데(광축)에서 더 내려간 각
+    const dy = yTap - vh / 2;
+    if (rel <= 0.01 || dy <= 2) return null;
+    const f = dy / Math.tan(rel);
+    const scale = f / Math.max(vw, vh);
+    if (scale < 0.3 || scale > 3) return null;
+    return scale;
+  },
+};
+
+// ============================================
+// 위험 판단: 방향 + 거리 + 클래스 가중치
 // ============================================
 function assess(dets, vw, vh, minProximity) {
   for (const det of dets) {
     const info = classInfo(det.label);
     det.ko = info.ko;
     det.color = info.color;
-    // 근접도: 박스의 '아랫변 위치'를 주로 쓴다. 바닥에 놓인 물체는 가까울수록 화면 아래쪽에 밑이 걸리므로
-    // 물체가 원래 커서(버스, 굵은 기둥) 멀리서도 박스가 크게 잡히는 경우를 걸러낸다. 박스 높이는 보조로만 반영.
-    det.proxH = (det.y2 - det.y1) / vh; // 박스 높이 비율 (0~1)
-    det.proxB = Math.max(0, Math.min(1, (det.y2 / vh - 0.5) / 0.5)); // 아랫변이 화면 중간(0)~맨 아래(1)
-    det.prox = det.proxB * (0.6 + 0.4 * det.proxH); // 0~1. 멀리 있는 큰 물체: 아랫변이 위쪽 → 작게
+    // 거리(m): 박스 아랫변 위치(+사람·차량은 크기)로 추정 → 근접도 0~1 로 바꿔 위험도에 반영
+    //   1m 이하 → 1.0, 6m 이상 → 0. 원래 큰 물체가 멀리 있으면 아랫변이 위쪽이라 거리가 멀게 나온다.
+    const est = Range.estimate(det, vw, vh);
+    det.dist = est.d;
+    det.distSrc = est.src;
+    det.prox = est.d == null ? 0 : Math.max(0, Math.min(1, (6 - est.d) / 5));
     const cx = (det.x1 + det.x2) / 2 / vw;
     det.dir = cx < 0.35 ? 'left' : cx > 0.65 ? 'right' : 'center';
-    det.near = det.prox >= 0.5;
+    det.near = est.d != null && est.d <= 2.5;
     det.risk = det.score * info.weight * Math.min(1, det.prox / 0.5);
   }
   dets.sort((a, b) => b.risk - a.risk);
@@ -514,6 +584,9 @@ const settings = {
   flashLevel: 'light', // light | mid | strong
   onboarded: false, // 첫 접속 안내를 봤는지
   useWebGpu: true, // WebGPU 시도 여부. 기기에서 실패하면 자동으로 false 로 저장
+  camHeight: 1.3, // 카메라(폰)의 지면 높이 m. 가슴 높이 기준
+  focalScale: 0.77, // 픽셀 초점거리 ÷ 긴 변 픽셀 수. 0.77 ≈ 화각 66° (일반 폰 기본 카메라). '1m 보정'으로 기기별 조정
+  focalCalibrated: false, // 1m 보정을 했는지
 };
 
 function loadSettings() {
@@ -661,7 +734,7 @@ function drawDetections(ctx, dets, best) {
   }
   if (best) {
     ctx.font = 'bold 18px system-ui, sans-serif';
-    const text = `⚠ ${best.ko} · ${DIR_KO[best.dir]} · ${best.near ? '가까움' : '접근 중'}`;
+    const text = `⚠ ${best.ko} · ${DIR_KO[best.dir]} · ${best.dist != null ? '약 ' + best.dist.toFixed(1) + 'm' : '접근 중'}`;
     const tw = ctx.measureText(text).width + 16;
     ctx.fillStyle = 'rgba(239, 68, 68, 0.85)';
     ctx.fillRect(8, 8, tw, 30);
@@ -680,7 +753,7 @@ function updateDetectionList(dets, best) {
     .map((d) => {
       const cls = d === best ? 'danger' : '';
       return `<li class="${cls}"><span class="dot" style="background:${d.color}"></span>` +
-        `<b>${d.ko}</b> ${(d.score * 100).toFixed(0)}% · ${DIR_KO[d.dir]} · 근접 ${(d.prox * 100).toFixed(0)}%</li>`;
+        `<b>${d.ko}</b> ${(d.score * 100).toFixed(0)}% · ${DIR_KO[d.dir]} · ${d.dist != null ? '약 ' + d.dist.toFixed(1) + 'm' : '거리 모름'}</li>`;
     })
     .join('');
 }
@@ -765,7 +838,8 @@ async function inferenceLoop() {
         }
         const conf = parseFloat(ui.threshold.value) || 0.25;
         const requiredFrames = parseInt(ui.steadyFrames.value, 10) || 3;
-        const minProximity = parseFloat(ui.proximity.value) || 0.2;
+        const maxDist = parseFloat(ui.proximity.value) || 5; // 설정: 이 거리(m) 안일 때만 알림
+        const minProximity = Math.max(0.02, (6 - maxDist) / 5);
 
         const lb = preprocess(src, inputSize);
         const result = await withTimeout(session.run({ [inputName]: lb.tensor }), CONFIG.frameTimeoutMs, '추론');
@@ -991,6 +1065,8 @@ function syncSettingsUI() {
   document.getElementById('flashToggle').checked = settings.flash;
   document.getElementById('startFlashToggle').checked = settings.flash;
   document.getElementById('webgpuToggle').checked = settings.useWebGpu;
+  document.getElementById('camHeight').value = Math.round(settings.camHeight * 100);
+  renderRangeInfo();
 }
 
 function bindSettingsUI() {
@@ -1024,6 +1100,34 @@ function bindSettingsUI() {
     if (!testVibration()) log('진동을 지원하지 않거나 차단된 기기입니다.');
   });
   document.getElementById('btnFlashTest').addEventListener('click', testFlash);
+  document.getElementById('camHeight').addEventListener('change', (e) => {
+    const cm = parseFloat(e.target.value);
+    if (cm >= 50 && cm <= 250) { settings.camHeight = cm / 100; saveSettings(); renderRangeInfo(); }
+  });
+  document.getElementById('btnCalib').addEventListener('click', () => {
+    Range.calibrating = !Range.calibrating;
+    renderRangeInfo();
+    if (Range.calibrating) {
+      panels.settings.hidden = true;
+      log('📏 보정: 줄자로 잰 거리(기본 1m) 앞 바닥에 물건을 두고, 폰을 평소보다 조금 더 숙여 그 지점이 화면 아래쪽 1/3쯤에 오게 한 뒤 화면에서 그 지점을 한 번 누르세요.');
+    }
+  });
+  document.getElementById('btnCalibReset').addEventListener('click', () => {
+    settings.focalScale = 0.77; settings.focalCalibrated = false; saveSettings(); renderRangeInfo();
+    log('거리 보정을 기본값(화각 66°)으로 되돌렸습니다');
+  });
+  ui.overlay.addEventListener('click', (e) => {
+    if (!Range.calibrating) return;
+    const rect = ui.overlay.getBoundingClientRect();
+    const y = ((e.clientY - rect.top) / rect.height) * ui.overlay.height;
+    const D = (parseFloat(document.getElementById('calibDist').value) || 100) / 100;
+    const scale = Range.calibrateFromTap(y, ui.overlay.width, ui.overlay.height, D);
+    Range.calibrating = false;
+    if (scale == null) { log('✗ 보정 실패: 누른 지점이 화면 가운데보다 아래(바닥)여야 합니다. 폰을 조금 더 숙이고 다시 해 보세요.'); renderRangeInfo(); return; }
+    settings.focalScale = scale; settings.focalCalibrated = true; saveSettings(); renderRangeInfo();
+    log(`✓ 거리 보정 완료: 초점거리 계수 ${scale.toFixed(2)} (기울기 ${Range.pitch().toFixed(0)}°, 카메라 높이 ${settings.camHeight}m)`);
+  });
+  setInterval(renderRangeInfo, 1000);
   document.getElementById('btnSettings').addEventListener('click', () => {
     syncSettingsUI();
     panels.settings.hidden = false;
@@ -1035,6 +1139,14 @@ function bindSettingsUI() {
   // 시작 안내 창
   if (!canVibrate) document.getElementById('noVibrateNote').hidden = false;
   document.getElementById('btnStartApp').addEventListener('click', startApp);
+}
+
+function renderRangeInfo() {
+  const el = document.getElementById('rangeInfo');
+  if (!el) return;
+  const p = Range.pitch();
+  el.textContent = `기울기 ${p.toFixed(0)}° (${Range.src === 'sensor' ? '센서' : '기본값'}) · 초점거리 계수 ${settings.focalScale.toFixed(2)} (${settings.focalCalibrated ? '보정됨' : '기본 화각 66°'})` +
+    (Range.calibrating ? ' · 📏 보정 중: 화면의 바닥 지점을 누르세요' : '');
 }
 
 function showStartOverlay() {
@@ -1051,6 +1163,7 @@ async function startApp() {
   settings.onboarded = true;
   saveSettings();
   panels.start.hidden = true;
+  Range.start().then((ok) => log(ok ? '✓ 기울기 센서 사용 (거리 계산에 반영)' : '기울기 센서 없음 → 기본 기울기(−12°)로 거리 계산'));
 
   const imageUrl = new URLSearchParams(location.search).get('image');
   if (imageUrl) {
