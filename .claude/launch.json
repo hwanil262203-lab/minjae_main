@@ -25,7 +25,7 @@
         "--bind",
         "127.0.0.1",
         "--directory",
-        "../minjae-gps"
+        "C:\\Users\\user\\Downloads\\프로젝트\\minjae-gps"
       ],
       "port": 8001
     }
