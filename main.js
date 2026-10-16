@@ -539,16 +539,18 @@ const VIB_STRENGTH = {
 const FLASH_OPACITY = { light: 0.22, mid: 0.38, strong: 0.55 };
 
 // ============================================
-// 진동: 방향과 무관. 거리(박스 높이 비율)만으로 세기를 정하고, 위험물이 화면에서 사라질 때까지 계속 울린다.
-//   가까울수록 진동이 길고 쉬는 시간이 짧다 (웹 진동 API 는 강도 조절이 없어 이렇게 흉내 낸다).
+// 진동: 방향과 무관. 가장 위험한 대상 하나를 골라(assess 가 위험도 순으로 정렬) 그 대상의
+//   가중 위험도(risk = 신뢰도 × 장벽 가중치 × 근접도)만으로 세기를 정하고, 사라질 때까지 계속 울린다.
+//   위험도가 높을수록 진동이 길고 쉬는 시간이 짧다 (웹 진동 API 는 강도 조절이 없어 이렇게 흉내 낸다).
 // ============================================
 const vib = { key: null, t: 0, cycleMs: 0 };
 const canVibrate = 'vibrate' in navigator;
 
-// prox: 0(멀다) ~ 1(코앞). 한 사이클 [울림, 쉼] 을 여러 번 이어 붙여 약 1.5초짜리 패턴을 만든다.
-function vibrationPattern(prox, strength = settings.vibStrength) {
+// risk: 0 ~ 1 (예: 계단 가중치 1.0 × 신뢰도 0.8 × 근접 1.0 = 0.8). 한 사이클 [울림, 쉼] 을 이어 붙여 약 1.5초 패턴.
+const RISK_FULL = 0.7; // 이 위험도 이상이면 최대 세기
+function vibrationPattern(risk, strength = settings.vibStrength) {
   const s = VIB_STRENGTH[strength] || VIB_STRENGTH.mid;
-  const level = Math.max(0, Math.min(1, (prox - 0.2) / 0.5)); // 근접 임계치(0.2)~0.7 을 0~1 로
+  const level = Math.max(0, Math.min(1, risk / RISK_FULL));
   const on = Math.round((180 + 320 * level) * s.scale); // 180~500ms
   const off = Math.round(320 - 220 * level); // 320~100ms
   const pattern = [];
@@ -586,10 +588,10 @@ function vibrateFor(det) {
     return; // 같은 대상이 계속 보이는 동안은 조용히
   }
   if (mute.label) clearMute('다른 위험물 감지'); // 다른 종류가 나타나면 무음은 끝
-  const key = `${det.label}|${Math.round(det.prox * 10)}`;
+  const key = `${det.label}|${Math.round(det.risk * 10)}`;
   const now = performance.now();
   if (key !== vib.key || now - vib.t > vib.cycleMs) {
-    const pattern = vibrationPattern(det.prox);
+    const pattern = vibrationPattern(det.risk);
     if (canVibrate) navigator.vibrate(pattern);
     vib.key = key;
     vib.t = now;
@@ -621,7 +623,7 @@ function setFlash(on) {
 
 function testVibration() {
   if (!canVibrate) return false;
-  // 가까운 위험물(근접 0.6) 세기로 1.5초 체감
+  // 위험도 0.6 (가까운 계단을 60% 신뢰도로 본 정도) 세기로 1.5초 체감
   return navigator.vibrate(vibrationPattern(0.6));
 }
 
