@@ -45,6 +45,8 @@ DEFAULT_ALIASES = {
     "stairs": "stairs", "stair": "stairs", "staircase": "stairs", "stairs up": "stairs",
     "stairs down": "stairs", "stairs upward": "stairs", "stairs downward": "stairs",
     "upstairs": "stairs", "downstairs": "stairs", "step": "stairs", "steps": "stairs",
+    "upstair": "stairs", "downstair": "stairs", "ascending stairs": "stairs", "descending stairs": "stairs",
+    "escaliers": "stairs",
     # pole
     "pole": "pole", "poles": "pole", "lamp post": "pole", "lamppost": "pole", "lamp": "pole",
     "street light": "pole", "streetlight": "pole", "light pole": "pole", "electric pole": "pole",
